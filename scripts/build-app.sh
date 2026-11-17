@@ -2,9 +2,18 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 if [[ "$(uname -s)" != Darwin ]]; then echo 'Cage.app must be built on macOS.' >&2; exit 1; fi
-case "${1:-}" in ''|--install|--macos-trial|--install-macos-trial|--intel-macos-test) ;; *) echo 'Usage: scripts/build-app.sh [--install|--macos-trial|--install-macos-trial|--intel-macos-test]' >&2; exit 2 ;; esac
+case "${1:-}" in ''|--install|--macos-trial|--install-macos-trial|--intel-macos-test|--vm-launcher) ;; *) echo 'Usage: scripts/build-app.sh [--install|--macos-trial|--install-macos-trial|--intel-macos-test|--vm-launcher]' >&2; exit 2 ;; esac
 bundle_id=io.github.lee-xeo.claude-cage
 app_name=Cage
+vm_launcher=false
+local_build=false
+if [[ ${CAGE_LOCAL_BUILD:-0} == 1 ]]; then local_build=true; fi
+if [[ ${1:-} == --vm-launcher ]]; then
+  [[ $(uname -m) == arm64 ]] || { echo 'The native VM launcher requires Apple Silicon.' >&2; exit 2; }
+  bundle_id+=.vm-launcher
+  app_name='Cage VM Launcher'
+  vm_launcher=true
+fi
 if [[ "${1:-}" == *macos-trial ]]; then
   bundle_id+=.macos-trial
   app_name='Cage macOS'
@@ -35,7 +44,7 @@ check_destination() {
 }
 check_destination "$app_destination"
 if [[ "${1:-}" == --install* ]]; then check_destination "$installed_app"; fi
-version="$(tr -d '\n\r' < VERSION)"
+version="${CAGE_BUILD_VERSION:-$(tr -d '\n\r' < VERSION)}"
 if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]; then echo 'Invalid VERSION.' >&2; exit 1; fi
 short_version="${version%%-*}"
 build_version="${CAGE_BUILD_NUMBER:-1}"
@@ -100,6 +109,8 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
 <key>CFBundleVersion</key><string>$build_version</string>
 <key>CFBundleShortVersionString</key><string>$short_version</string>
 <key>CageVersion</key><string>$version</string>
+<key>CageVMLauncher</key><$vm_launcher/>
+<key>CageLocalBuild</key><$local_build/>
 <key>CFBundleExecutable</key><string>Cage</string>
 <key>CFBundleIconFile</key><string>Cage</string>
 <key>CFBundlePackageType</key><string>APPL</string>
@@ -110,6 +121,27 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
 PLIST
 sign=(codesign --force --sign "$identity")
 if [[ "$identity" != - ]]; then sign+=(--timestamp --options runtime); fi
+if [[ $(uname -m) == arm64 ]]; then
+  # The VZ process owns the native desktop and needs its own AppKit identity.
+  # Keep the runner's executable and entitlements identical to the core build.
+  vm_app="$bundle/Contents/Resources/CageVM.app"
+  mkdir -p "$vm_app/Contents/MacOS"
+  cp "$bundle/Contents/Resources/cage" "$vm_app/Contents/MacOS/cage"
+  cat > "$vm_app/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>$bundle_id.vm</string>
+<key>CFBundleName</key><string>Cage VM</string>
+<key>CFBundleExecutable</key><string>cage</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleVersion</key><string>$build_version</string>
+<key>LSMinimumSystemVersion</key><string>14.0</string>
+<key>LSUIElement</key><true/>
+<key>NSHighResolutionCapable</key><true/>
+</dict></plist>
+PLIST
+  "${sign[@]}" --entitlements third_party/lima/vz.entitlements "$vm_app"
+fi
 "${sign[@]}" --entitlements third_party/lima/vz.entitlements "$bundle/Contents/Resources/cage"
 account_signing=("${sign[@]}")
 if [[ -n "${CAGE_PROVISIONING_PROFILE:-}" ]]; then

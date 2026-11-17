@@ -1,3 +1,43 @@
+import Foundation
+
+// Main-actor state shared by frame entry/exit, idle expiry and stream teardown.
+// Cancellation alone cannot revoke an expiry whose sleep already completed.
+struct MacWindowStreamLifetime {
+    struct Lease: Equatable { let id: UUID; let generation: String }
+    private(set) var generation = UUID().uuidString
+    private(set) var inFlight = 0
+    private var lease: Lease?
+
+    mutating func beginFrame() { inFlight += 1; lease = nil }
+    mutating func finishFrame() -> Bool {
+        precondition(inFlight > 0)
+        inFlight -= 1
+        return inFlight == 0
+    }
+    mutating func renewIdle() -> Lease? {
+        lease = nil
+        guard inFlight == 0 else { return nil }
+        let next = Lease(id: UUID(), generation: generation)
+        lease = next
+        return next
+    }
+    mutating func consumeIdle(_ expected: Lease, cancelled: Bool) -> Bool {
+        guard !cancelled, inFlight == 0, lease == expected, generation == expected.generation else { return false }
+        lease = nil
+        return true
+    }
+    // Revoke synchronously before awaiting the old SCStream's teardown.
+    // The returned reservation must still be current before installing a stream.
+    mutating func replaceStream(expected: String) -> String? {
+        guard generation == expected else { return nil }
+        lease = nil
+        generation = UUID().uuidString
+        return generation
+    }
+    func ownsStream(_ expected: String) -> Bool { generation == expected }
+}
+
+#if !CAGE_WINDOW_STREAM_TEST
 import AppKit
 import CoreImage
 import ScreenCaptureKit
@@ -7,7 +47,8 @@ final class MacWindowStream: NSObject, SCStreamOutput, SCStreamDelegate {
     static let shared = MacWindowStream()
     private var stream: SCStream?
     private var key = ""
-    private var generation = UUID().uuidString
+    private var lifetime = MacWindowStreamLifetime()
+    private var generation: String { lifetime.generation }
     private var number: UInt64 = 0
     private var sequence: String { generation + "-" + String(number) }
     private var buffer: CVPixelBuffer?
@@ -38,19 +79,29 @@ final class MacWindowStream: NSObject, SCStreamOutput, SCStreamDelegate {
     nonisolated func stream(_ stream: SCStream, didStopWithError error: Error) {
         Task { @MainActor [weak self] in
             guard let self, self.stream === stream else { return }
+            _ = self.lifetime.replaceStream(expected: self.generation)
+            self.expiry?.cancel()
+            self.expiry = nil
             self.stream = nil
             self.buffer = nil
+            self.key = ""
             self.wake()
         }
     }
 
-    private func stop() async {
+    private func stop(ifGeneration expected: String, idleLease: MacWindowStreamLifetime.Lease? = nil) async -> String? {
+        // Validate expiry at the destructive operation, not before an await.
+        if let idleLease, !lifetime.consumeIdle(idleLease, cancelled: Task.isCancelled) { return nil }
+        guard let reservation = lifetime.replaceStream(expected: expected) else { return nil }
+        if idleLease == nil { expiry?.cancel() }
+        expiry = nil
         let previous = stream
         stream = nil
         buffer = nil
         key = ""
         wake()
         try? await previous?.stopCapture()
+        return reservation
     }
 
     private func wake() {
@@ -80,10 +131,13 @@ final class MacWindowStream: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func renew() {
         expiry?.cancel()
-        expiry = Task { [weak self] in
+        expiry = nil
+        guard stream != nil, let lease = lifetime.renewIdle() else { return }
+        expiry = Task { @MainActor [weak self] in
             do { try await Task.sleep(nanoseconds: 1_500_000_000) }
             catch { return }
-            await self?.stop()
+            guard let self, !Task.isCancelled else { return }
+            _ = await self.stop(ifGeneration: lease.generation, idleLease: lease)
         }
     }
 
@@ -93,12 +147,18 @@ final class MacWindowStream: NSObject, SCStreamOutput, SCStreamDelegate {
         return true
     }
 
-    func frame(filter: SCContentFilter, configuration: SCStreamConfiguration, identity: String, after: String?, wait: Bool = false) async throws -> (CGImage?, String) {
+    func frame(filter: SCContentFilter, configuration: SCStreamConfiguration, identity: String, after: String?, wait: Bool = false, waitSeconds: Double = 2, forceSettled: Bool = false) async throws -> (CGImage?, String) {
+        lifetime.beginFrame()
         expiry?.cancel()
-        defer { renew() }
+        expiry = nil
+        defer { if lifetime.finishFrame() { renew() } }
         if stream == nil || key != identity {
-            await stop()
-            generation = UUID().uuidString
+            guard let reservation = await stop(ifGeneration: generation),
+                  lifetime.ownsStream(reservation), stream == nil else {
+                GuestDiagnostic.record("window", "stream_start_superseded")
+                throw Failure(7, "window_changed")
+            }
+            try Task.checkCancellation()
             number = 0
             key = identity
             configuration.minimumFrameInterval = CMTime(value: 1, timescale: 30)
@@ -108,22 +168,31 @@ final class MacWindowStream: NSObject, SCStreamOutput, SCStreamDelegate {
             try next.addStreamOutput(self, type: .screen, sampleHandlerQueue: DispatchQueue(label: "cage.window.frames"))
             stream = next
             do { try await next.startCapture() }
-            catch { await stop(); throw error }
+            catch { _ = await stop(ifGeneration: reservation); throw error }
+            guard lifetime.ownsStream(reservation), stream === next else {
+                GuestDiagnostic.record("window", "stream_start_superseded")
+                throw Failure(7, "window_changed")
+            }
         }
+        let frameGeneration = generation
         // Only the first frame of a newly configured stream needs to wait.
         let deadline = Date().addingTimeInterval(5)
         while buffer == nil && stream != nil && Date() < deadline {
             try await waitForFrame(after: sequence, seconds: max(0, deadline.timeIntervalSinceNow))
+            guard lifetime.ownsStream(frameGeneration), key == identity else {
+                GuestDiagnostic.record("window", "stream_wait_superseded")
+                throw Failure(7, "window_changed")
+            }
         }
         if wait, buffer != nil, after == sequence {
             // Revalidate window ownership and the console session at least every
             // two seconds even when ScreenCaptureKit reports no changed pixels.
-            try await waitForFrame(after: sequence, seconds: 2)
+            try await waitForFrame(after: sequence, seconds: waitSeconds)
         }
-        guard key == identity else { throw Failure(7, "window_changed") }
-        guard let buffer else { await stop(); throw Failure(8, "capture_no_frame") }
+        guard lifetime.ownsStream(frameGeneration), key == identity else { throw Failure(7, "window_changed") }
+        guard let buffer else { _ = await stop(ifGeneration: frameGeneration); throw Failure(8, "capture_no_frame") }
         let sequence = self.sequence
-        if sequence == after { return (nil, sequence) }
+        if sequence == after && !forceSettled { return (nil, sequence) }
         let image = CIImage(cvPixelBuffer: buffer)
         // Reading the surface back copies the whole frame. It runs off the main
         // actor so that input and other requests are not held behind it.
@@ -135,3 +204,5 @@ final class MacWindowStream: NSObject, SCStreamOutput, SCStreamDelegate {
         return (output, sequence)
     }
 }
+
+#endif

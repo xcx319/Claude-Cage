@@ -487,6 +487,7 @@ func (s *Server) handler() http.Handler {
 		mux.HandleFunc("POST /api/macos/first-setup", s.macOSLoginWindow)
 		mux.HandleFunc("POST /api/macos/login", s.macOSLoginWindow)
 		mux.HandleFunc("POST /api/macos/maintenance", s.macOSLoginWindow)
+		mux.HandleFunc("GET /api/macos/native-desktop", s.macOSNativeDesktop)
 		s.registerMacOSClaudeRoutes(mux)
 		s.registerMacOSBrowserRoutes(mux)
 		mux.HandleFunc("POST /api/macos/project-approval", s.macOSProjectApproval)

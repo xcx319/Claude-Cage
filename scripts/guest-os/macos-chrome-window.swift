@@ -22,6 +22,7 @@ final class MacChromeWindow {
     }
     private var logins: [String: Login] = [:]
     private var currentLogin: String?
+    private var ownedPIDCache: [pid_t: (directory: URL, startSec: UInt64, startUsec: UInt64, verifiedAt: TimeInterval)] = [:]
 
     private init() {
         var rule: SecRequirement?
@@ -94,7 +95,27 @@ final class MacChromeWindow {
     }
 
     private var activeDirectory: URL { currentLogin.flatMap { logins[$0]?.directory } ?? profile }
-    func owns(_ pid: pid_t) -> Bool { applications(activeDirectory).contains { $0.processIdentifier == pid } }
+    func owns(_ pid: pid_t) -> Bool {
+        let directory = activeDirectory
+        let now = ProcessInfo.processInfo.systemUptime
+        var info = proc_bsdinfo()
+        let length = Int32(MemoryLayout.size(ofValue: info))
+        let hasInfo = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, length) == length
+        if hasInfo, let cached = ownedPIDCache[pid], cached.directory == directory,
+           cached.startSec == info.pbi_start_tvsec, cached.startUsec == info.pbi_start_tvusec,
+           now - cached.verifiedAt < 1,
+           let running = NSRunningApplication(processIdentifier: pid),
+           !running.isTerminated, running.bundleURL?.standardizedFileURL == app.standardizedFileURL {
+            return true
+        }
+        let verified = applications(directory).contains { $0.processIdentifier == pid }
+        if verified && hasInfo {
+            ownedPIDCache[pid] = (directory, info.pbi_start_tvsec, info.pbi_start_tvusec, now)
+        } else {
+            ownedPIDCache.removeValue(forKey: pid)
+        }
+        return verified
+    }
     var status: [String: Any] {
         let regular = applications(profile).first
         var result: [String: Any] = ["surface": "browser", "installed": fm.fileExists(atPath: app.path),
@@ -239,6 +260,7 @@ final class MacChromeWindow {
 
     func finish(_ token: String) {
         guard let login = logins.removeValue(forKey: token) else { return }
+        ownedPIDCache.removeAll()
         login.expiry.cancel()
         if login.process.isRunning { login.process.terminate() }
         if currentLogin == token {

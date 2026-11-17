@@ -4,6 +4,7 @@ import { MacOSLogin } from "./macos-login";
 import { api, native, nativeAvailable } from "./api";
 import { BrowserFavorites } from "./browser-favorites";
 import { BrowserUploads } from "./browser-uploads";
+import { ProjectDialog } from "./project-dialog";
 import { sendFiles } from "./file-transfer";
 import { prepareClipboardPaste, sendImage } from "./image-transfer";
 import { installRemoteInput } from "./remote-input";
@@ -12,6 +13,7 @@ import { copyGuestText } from "./shared-clipboard.mjs";
 import { useWindowVisibility } from "./window-visibility";
 import { createMacWindowConnection } from "./macos-window-connection.mjs";
 import { createMacFrameConnection } from "./macos-frame-connection.mjs";
+import { useNativeDesktopActive } from "./native-desktop";
 import "./macos-claude-window.css";
 
 const messages = {
@@ -59,11 +61,12 @@ function matchWindowBackground(img, pane, canvasRef) {
   pane.style.backgroundColor = uniform && pixels[3] === 255 ? `rgb(${pixels[0]}, ${pixels[1]}, ${pixels[2]})` : "";
 }
 
-export function MacOSAppWindow({ browser = false, onOpenPage, visible, keyboard = "mac", remoteRef, sidebarCollapsed, onExpand, onConfirm, uploads = [], onStatus = () => {}, onFallback = () => {} }) {
+export function MacOSAppWindow({ browser = false, onOpenPage, visible, keyboard = "mac", remoteRef, sidebarCollapsed, onExpand, onConfirm, uploads = [], status, onProjectOpened = () => {}, onStatus = () => {}, onFallback = () => {} }) {
   const appName = browser ? "Google Chrome" : "Claude Desktop";
   const base = browser ? "/macos-browser" : "/macos/claude";
+  const nativeDesktopOpen = useNativeDesktopActive();
   const windowVisible = useWindowVisibility();
-  const screenVisible = visible && windowVisible;
+  const screenVisible = visible && windowVisible && !nativeDesktopOpen;
   const connection = useRef(null);
   const [inputChannel, setInputChannel] = useState(null);
   const frameConnection = useRef(null);
@@ -72,6 +75,15 @@ export function MacOSAppWindow({ browser = false, onOpenPage, visible, keyboard 
   const [state, setState] = useState(null);
   const [error, setError] = useState("");
   const [fileError, setFileError] = useState("");
+  const [closedChooser, setClosedChooser] = useState("");
+  const [selectedDirectoryRequest, setSelectedDirectoryRequest] = useState(null);
+  const detectedDirectoryRequest = uploads.find(item => item.directory && item.id !== closedChooser);
+  // Project authorization temporarily moves focus away from Claude's picker.
+  // Keep its request alive while the native authorization window is open.
+  const directoryRequest = !browser && visible ? (selectedDirectoryRequest || detectedDirectoryRequest) : null;
+  useEffect(() => {
+    if (!browser && visible && detectedDirectoryRequest && !selectedDirectoryRequest) setSelectedDirectoryRequest(detectedDirectoryRequest);
+  }, [browser, visible, detectedDirectoryRequest, selectedDirectoryRequest]);
   const [transferring, setTransferring] = useState(false);
   const [revision, refresh] = useState(0);
   const [image, setImage] = useState(null);
@@ -288,7 +300,22 @@ export function MacOSAppWindow({ browser = false, onOpenPage, visible, keyboard 
   }
   if (!visible) return null;
   return <section className="claude-desktop-view mac-claude" aria-label={"虚拟 Mac 中的 " + appName}>
-    {(browser || !nativeAvailable()) && <BrowserUploads requests={uploads} onStatus={onStatus} />}
+    {directoryRequest && <ProjectDialog key={directoryRequest.id} status={status} activate={false}
+      onClose={() => {
+        setSelectedDirectoryRequest(null);
+        setClosedChooser(directoryRequest.id);
+        void api("/input/files/cancel", { target: "desktop", id: directoryRequest.id }).catch(error => onStatus(error.message));
+      }}
+      onOpened={async workspace => {
+        // The native project approval app took focus. Restore Claude before
+        // submitting to the original picker; the guest still validates its ID.
+        await request("launch");
+        await api("/input/files/directory", { target: "desktop", id: directoryRequest.id, workspace });
+        setClosedChooser(directoryRequest.id);
+        setSelectedDirectoryRequest(null);
+        await onProjectOpened(workspace);
+      }} />}
+    {!directoryRequest && <BrowserUploads requests={uploads} onStatus={onStatus} onChooseDirectory={browser ? undefined : request => setSelectedDirectoryRequest(request)} />}
     <DesktopToolbar title={appName} desktop={state} platform="macOS" zoom={zoom} setZoom={setZoom} onConfirm={onConfirm}
       onStop={browser ? undefined : () => action("stop")} refresh={() => refresh(n => n+1)} sidebarCollapsed={sidebarCollapsed} onExpand={onExpand}>
       {browser && <BrowserFavorites ready={Boolean(state?.installed)} onOpen={onOpenPage} />}

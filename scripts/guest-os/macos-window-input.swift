@@ -16,7 +16,7 @@ func checkedMacInputWindow(_ input: Request, window: SCWindow) throws -> MacInpu
     func unavailable(_ reason: String) -> Failure {
         Failure(7, project ? "project_" + reason : "window_changed")
     }
-    guard AXIsProcessTrusted() else { throw Failure(9, "accessibility_permission") }
+    guard AccessibilityTrust.shared.current else { throw Failure(9, "accessibility_permission") }
     guard let pid = window.owningApplication?.processID, input.pid == pid, input.window == window.windowID else {
         throw unavailable("window_identity_changed")
     }
@@ -43,6 +43,25 @@ func checkedMacInputWindow(_ input: Request, window: SCWindow) throws -> MacInpu
         throw unavailable("window_geometry_changed")
     }
     return MacInputWindow(app: app, focused: focused, pid: pid, origin: origin, extent: extent)
+}
+
+// Global guest pointer events are allowed only over the validated front window.
+@MainActor
+func macDesktopOwnsPoint(_ point: CGPoint, target: MacInputWindow, window: SCWindow) -> Bool {
+    guard NSWorkspace.shared.frontmostApplication?.processIdentifier == target.pid else { return false }
+    var element: AXUIElement?
+    guard AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(point.x), Float(point.y), &element) == .success,
+          let element else { return false }
+    var owner: pid_t = 0
+    guard AXUIElementGetPid(element, &owner) == .success, owner == target.pid else { return false }
+    let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String:Any]] ?? []
+    let foremost = windows.first { info in
+        guard info[kCGWindowOwnerPID as String] as? pid_t == target.pid, info[kCGWindowLayer as String] as? Int == 0,
+              let box = info[kCGWindowBounds as String] as? NSDictionary,
+              let rect = CGRect(dictionaryRepresentation: box) else { return false }
+        return rect.contains(point)
+    }
+    return foremost?[kCGWindowNumber as String] as? CGWindowID == window.windowID
 }
 
 @MainActor
@@ -77,6 +96,9 @@ final class MacWindowInputSession {
     private static var keyOwners: [UInt16: UUID] = [:]
     private let id = UUID()
     private let source = CGEventSource(stateID: .privateState)
+    private var gestureNumber: Int64 = 0
+    private var physicalButtons = Set<Int>()
+    private var physicalDownAt: TimeInterval = 0
     private var keys: [UInt16: (pid_t, CGWindowID)] = [:]
     private var pressedCodes: [String: UInt16] = [:]
     private var buttons: [Int: (pid_t, CGWindowID, CGPoint, Int)] = [:]
@@ -103,7 +125,7 @@ final class MacWindowInputSession {
         try Self.requirePointerOwner(self)
         if let pending = press {
             guard pending.pid == target.pid, pending.window == window.windowID else { throw Failure(7, "window_changed") }
-            pending.down.postToPid(target.pid)
+            pending.down.post(tap: .cghidEventTap)
             press = nil
         }
         guard let down = input.down, let name = input.code, let key = input.key else { throw Failure(8, "invalid_input") }
@@ -126,17 +148,18 @@ final class MacWindowInputSession {
         event.postToPid(target.pid)
     }
 
-    // A window-targeted NSEvent carries AppKit-local coordinates. Chrome
-    // consumes Quartz mouse positions instead. Route a physical-style event
-    // only when the intended signed window is still under that screen point.
+    // Physical guest pointer events are emitted only after validating the
+    // foreground application and the exact window under each screen point.
     func pointer(_ input: Request, target: MacInputWindow, window: SCWindow, canvas: ClaudeCanvas?) throws {
         try Self.requirePointerOwner(self)
         guard let phase = input.phase, ["down", "move", "up"].contains(phase),
               let x = input.x, let y = input.y, x.isFinite, y.isFinite, (0..<1).contains(x), (0..<1).contains(y) else { throw Failure(8, "invalid_input") }
         let crop = canvas?.cropTop ?? 0
         let point = CGPoint(x: target.origin.x + target.extent.width * x, y: target.origin.y + crop + (target.extent.height - crop) * y)
-        if input.surface == "browser", try !MacChromeWindow.shared.ownsPoint(point, pid: target.pid, window: window.windowID) {
-            throw Failure(7, "window_changed")
+        if input.surface == "browser" {
+            guard try MacChromeWindow.shared.ownsPoint(point, pid: target.pid, window: window.windowID) else { throw Failure(7, "window_changed") }
+        } else {
+            guard macDesktopOwnsPoint(point, target: target, window: window) else { throw Failure(7, "window_changed") }
         }
         let button = phase == "move" ? buttons.keys.sorted().first : input.button
         let types: [NSEvent.EventType]
@@ -152,36 +175,48 @@ final class MacWindowInputSession {
             if phase == "up", button == 0, flags(input).isEmpty,
                let hit = macPressTarget(target, point: point), CFEqual(hit, pending.element) {
                 buttons.removeValue(forKey: 0)
+                physicalButtons.remove(0)
                 if buttons.isEmpty { Self.pointerOwner = nil }
                 guard AXUIElementPerformAction(hit, kAXPressAction as CFString) == .success else { throw Failure(8, "input_failed") }
                 return
             }
-            pending.down.postToPid(target.pid)
+            pending.down.post(tap: .cghidEventTap)
+            if phase == "move" { Thread.sleep(forTimeInterval: 0.05) }
         }
+        let previousPoint = button.flatMap { buttons[$0]?.2 }
         let type = button.map { types[$0] } ?? .mouseMoved
         let count = input.clicks ?? button.flatMap { buttons[$0]?.3 } ?? 0
         let event: CGEvent
-        if input.surface == "browser" {
-            guard let cgType = CGEventType(rawValue: UInt32(type.rawValue)),
-                  let pointer = CGEvent(mouseEventSource: source, mouseType: cgType, mouseCursorPosition: point,
-                                        mouseButton: button == 1 ? .center : button == 2 ? .right : .left) else {
-                throw Failure(8, "input_failed")
-            }
-            pointer.flags = flags(input)
-            pointer.setIntegerValueField(.mouseEventClickState, value: Int64(count))
-            event = pointer
-        } else {
-            let local = CGPoint(x: point.x - target.origin.x, y: target.extent.height - (point.y-target.origin.y))
-            guard let pointer = NSEvent.mouseEvent(with: type, location: local, modifierFlags: NSEvent.ModifierFlags(rawValue: UInt(flags(input).rawValue)),
-                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: Int(window.windowID), context: nil,
-                eventNumber: 0, clickCount: count, pressure: phase == "up" ? 0 : 1)?.cgEvent else { throw Failure(8, "input_failed") }
-            event = pointer
+        guard let cgType = CGEventType(rawValue: UInt32(type.rawValue)),
+              let pointer = CGEvent(mouseEventSource: input.surface == "browser" ? source : nil,
+                                    mouseType: cgType, mouseCursorPosition: point,
+                                    mouseButton: button == 1 ? .center : button == 2 ? .right : .left) else {
+            throw Failure(8, "input_failed")
         }
+        pointer.flags = flags(input)
+        pointer.setIntegerValueField(.mouseEventClickState, value: Int64(count))
+        if input.surface != "browser" {
+            if phase == "down" {
+                gestureNumber = Int64(CGEventSource.counterForEventType(.hidSystemState, eventType: .leftMouseDown)) + 1
+                physicalDownAt = ProcessInfo.processInfo.systemUptime
+            }
+            if button != nil { pointer.setIntegerValueField(.mouseEventNumber, value: gestureNumber) }
+            if phase == "move", let button, let previous = buttons[button]?.2 {
+                let dx = point.x - previous.x, dy = point.y - previous.y
+                pointer.setIntegerValueField(.mouseEventDeltaX, value: Int64(dx.rounded()))
+                pointer.setIntegerValueField(.mouseEventDeltaY, value: Int64(dy.rounded()))
+                pointer.setDoubleValueField(.mouseEventDeltaX, value: Double(dx))
+                pointer.setDoubleValueField(.mouseEventDeltaY, value: Double(dy))
+            }
+        }
+        event = pointer
         event.location = point
         event.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: Int64(window.windowID))
         event.setIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent, value: Int64(window.windowID))
-        if phase == "down", let button { buttons[button] = (target.pid, window.windowID, point, count); Self.pointerOwner = id }
-        if phase == "up", let button { buttons.removeValue(forKey: button); if buttons.isEmpty { Self.pointerOwner = nil } }
+        // Both surfaces post pointer events through the HID tap. A reset must
+        // release them through that same tap, including interrupted Chrome drags.
+        if phase == "down", let button { buttons[button] = (target.pid, window.windowID, point, count); physicalButtons.insert(button); Self.pointerOwner = id }
+        if phase == "up", let button { buttons.removeValue(forKey: button); physicalButtons.remove(button); if buttons.isEmpty { Self.pointerOwner = nil } }
         if phase == "move" { for button in Array(buttons.keys) { buttons[button] = (target.pid, window.windowID, point, count) } }
         // Preserve the existing AX activation for Electron buttons. A real
         // drag flushes the deferred down before its first dragged event.
@@ -190,8 +225,34 @@ final class MacWindowInputSession {
             press = (element, event, point, target.pid, window.windowID)
             return
         }
-        if input.surface == "browser" { event.post(tap: .cghidEventTap) }
-        else { event.postToPid(target.pid) }
+        if input.surface != "browser", phase == "move", let button, let previousPoint {
+            let elapsed = ProcessInfo.processInfo.systemUptime - physicalDownAt
+            if elapsed < 0.05 { Thread.sleep(forTimeInterval: 0.05 - elapsed) }
+            let distance = hypot(point.x - previousPoint.x, point.y - previousPoint.y)
+            let steps = max(1, min(60, Int(ceil(distance / 4))))
+            var prior = previousPoint
+            for index in 1...steps {
+                let fraction = CGFloat(index) / CGFloat(steps)
+                let next = CGPoint(x: previousPoint.x + (point.x - previousPoint.x) * fraction,
+                                   y: previousPoint.y + (point.y - previousPoint.y) * fraction)
+                guard macDesktopOwnsPoint(next, target: target, window: window),
+                      let motion = CGEvent(mouseEventSource: nil, mouseType: cgType, mouseCursorPosition: next,
+                                           mouseButton: button == 1 ? .center : button == 2 ? .right : .left) else { throw Failure(7, "window_changed") }
+                motion.flags = flags(input)
+                motion.setIntegerValueField(.mouseEventNumber, value: gestureNumber)
+                motion.setIntegerValueField(.mouseEventClickState, value: Int64(count))
+                motion.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: Int64(window.windowID))
+                motion.setIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent, value: Int64(window.windowID))
+                let dx = next.x - prior.x, dy = next.y - prior.y
+                motion.setIntegerValueField(.mouseEventDeltaX, value: Int64(dx.rounded()))
+                motion.setIntegerValueField(.mouseEventDeltaY, value: Int64(dy.rounded()))
+                motion.setDoubleValueField(.mouseEventDeltaX, value: Double(dx))
+                motion.setDoubleValueField(.mouseEventDeltaY, value: Double(dy))
+                motion.post(tap: .cghidEventTap)
+                prior = next
+                if index < steps { Thread.sleep(forTimeInterval: 0.002) }
+            }
+        } else { event.post(tap: .cghidEventTap) }
     }
 
     private func stillOwnsWindow(_ pid: pid_t, _ window: CGWindowID) -> Bool {
@@ -205,16 +266,21 @@ final class MacWindowInputSession {
             if stillOwnsWindow(target.0, target.1) { CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: false)?.postToPid(target.0) }
             if Self.keyOwners[code] == id { Self.keyOwners.removeValue(forKey: code) }
         }
-        for (button, target) in buttons where !(button == 0 && press != nil) && stillOwnsWindow(target.0, target.1) {
+        for (button, target) in buttons where !(button == 0 && press != nil) {
+            let physical = physicalButtons.contains(button)
+            guard physical ? (try? consoleUser()) != nil : stillOwnsWindow(target.0, target.1) else { continue }
             let type: CGEventType = button == 0 ? .leftMouseUp : button == 2 ? .rightMouseUp : .otherMouseUp
             let mouse: CGMouseButton = button == 0 ? .left : button == 2 ? .right : .center
             if let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: target.2, mouseButton: mouse) {
                 event.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: Int64(target.1))
                 event.setIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent, value: Int64(target.1))
-                event.postToPid(target.0)
+                if physical {
+                    event.setIntegerValueField(.mouseEventNumber, value: gestureNumber)
+                    event.post(tap: .cghidEventTap)
+                } else { event.postToPid(target.0) }
             }
         }
-        keys.removeAll(); pressedCodes.removeAll(); buttons.removeAll(); press = nil; composition = nil
+        keys.removeAll(); pressedCodes.removeAll(); buttons.removeAll(); physicalButtons.removeAll(); press = nil; composition = nil
         if Self.pointerOwner == id { Self.pointerOwner = nil }
     }
 

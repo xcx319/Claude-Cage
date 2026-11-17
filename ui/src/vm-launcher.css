@@ -1,0 +1,22 @@
+.vm-launcher { height: 100%; padding: 26px 38px 40px; overflow: auto; background: var(--chrome); }
+.vm-launcher-header { display: flex; align-items: center; justify-content: space-between; max-width: 920px; margin: 0 auto; }
+.vm-launcher-header span, .vm-launcher-header button, .vm-launcher-actions button, .vm-launcher-status dt { display: flex; align-items: center; gap: 9px; }
+.vm-launcher-header span { font-size: 20px; font-weight: 600; }
+.vm-launcher-header img { width: 29px; height: 29px; }
+.vm-launcher-card { max-width: 710px; margin: 45px auto 0; padding: 36px 42px; background: var(--paper); border: 1px solid var(--line); border-radius: 18px; }
+.vm-launcher-symbol { width: 82px; height: 82px; border-radius: 20px; display: grid; place-items: center; background: var(--chrome); margin-bottom: 24px; }
+.vm-launcher-eyebrow { color: var(--muted); font-size: 12px; margin: 0 0 8px; }
+.vm-launcher h1 { margin: 0; font-size: 29px; letter-spacing: -.5px; }
+.vm-launcher-intro, .vm-launcher-note { color: var(--muted); line-height: 1.65; }
+.vm-launcher-status { margin: 28px 0; border-block: 1px solid var(--line); padding: 10px 0; }
+.vm-launcher-status > div { display: flex; justify-content: space-between; padding: 9px 0; }
+.vm-launcher-status dt { color: var(--muted); }
+.vm-launcher-status dd { margin: 0; }
+.vm-launcher-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+.vm-launcher-actions button { min-height: 40px; }
+.vm-launcher-note { font-size: 12px; margin: 18px 0; }
+.vm-launcher details { border-top: 1px solid var(--line); padding-top: 18px; font-size: 12px; color: var(--muted); }
+.vm-launcher summary { cursor: pointer; }
+.vm-launcher pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 190px; overflow: auto; }
+.vm-launcher li { margin: 6px 0; }
+@media (max-width: 700px) { .vm-launcher { padding: 20px; } .vm-launcher-card { padding: 26px; margin-top: 28px; } }

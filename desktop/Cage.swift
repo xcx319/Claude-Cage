@@ -38,6 +38,7 @@ final class CageApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNaviga
     private var completeUpdateMenu: NSMenuItem!
     private var controllerNeedsUpdate = false
     private var appUpdater: CageAppUpdater!
+    private var vmLauncher: Bool { Bundle.main.object(forInfoDictionaryKey: "CageVMLauncher") as? Bool == true }
 
     private struct DesktopEntry {
         let status: String
@@ -64,7 +65,7 @@ final class CageApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNaviga
         NSApp.appearance = mode == "system" ? nil : NSAppearance(named: mode == "dark" ? .darkAqua : .aqua)
         makeMenus()
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1280, height: 850), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = CageProfile.macGuestTrial ? "Cage macOS" : "Cage"
+        window.title = vmLauncher ? "Cage 虚拟机启动器" : CageProfile.macGuestTrial ? "Cage macOS" : "Cage"
         window.titlebarAppearsTransparent = false
         window.backgroundColor = NSColor(srgbRed: 247.0/255, green: 247.0/255, blue: 247.0/255, alpha: 1)
         window.minSize = NSSize(width: 820, height: 580)
@@ -76,6 +77,7 @@ final class CageApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNaviga
         config.websiteDataStore = .default()
         config.userContentController.addScriptMessageHandler(self, contentWorld: .page, name: "cage")
         config.userContentController.addUserScript(WKUserScript(source: "window.cageNativeIMEAvailable = true;", injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        if vmLauncher { config.userContentController.addUserScript(WKUserScript(source: "window.cageVMLauncherPreferred = true;", injectionTime: .atDocumentStart, forMainFrameOnly: true)) }
         webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = self
         webView.uiDelegate = self
@@ -95,7 +97,7 @@ final class CageApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNaviga
         nativeInput.configure(web: webView)
         content.addSubview(nativeInput)
         NSLayoutConstraint.activate([webView.leadingAnchor.constraint(equalTo: content.leadingAnchor), webView.trailingAnchor.constraint(equalTo: content.trailingAnchor), webView.topAnchor.constraint(equalTo: content.topAnchor), webView.bottomAnchor.constraint(equalTo: content.bottomAnchor)])
-        loading = NSTextField(labelWithString: "正在启动 Cage 工作台…")
+        loading = NSTextField(labelWithString: vmLauncher ? "正在打开虚拟机启动器…" : "正在启动 Cage 工作台…")
         loading.font = NSFont.systemFont(ofSize: 16, weight: .medium)
         loading.textColor = NSColor(srgbRed: 54.0/255, green: 54.0/255, blue: 54.0/255, alpha: 1)
         loading.alignment = .center
@@ -254,7 +256,7 @@ final class CageApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNaviga
         }
     }
     private func bootstrap(options: [String] = []) {
-        loading.stringValue = options.contains("--complete-update") ? "正在停止环境并切换到新版后台…" : "正在启动 Cage 工作台…"
+        loading.stringValue = options.contains("--complete-update") ? "正在停止环境并切换到新版后台…" : vmLauncher ? "正在打开虚拟机启动器…" : "正在启动 Cage 工作台…"
         loading.isHidden = false; retry.isHidden = true; webView.isHidden = true
         completeUpdateButton.isHidden = true; existingEnvironmentButton.isHidden = true
         requestEntry(options: options) { result in
@@ -262,7 +264,7 @@ final class CageApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNaviga
             case .success(let entry):
                 self.controllerNeedsUpdate = entry.status != "ready"
                 self.completeUpdateMenu.isHidden = !self.controllerNeedsUpdate
-                let appTitle = CageProfile.macGuestTrial ? "Cage macOS" : "Cage"
+                let appTitle = self.vmLauncher ? "Cage 虚拟机启动器" : CageProfile.macGuestTrial ? "Cage macOS" : "Cage"
                 self.window.title = self.controllerNeedsUpdate ? "\(appTitle)（更新待完成）" : appTitle
                 if let url = entry.url { self.expectedPort = url.port!; self.webView.load(URLRequest(url: url)) }
                 else { self.showError(entry.message); self.completeUpdateButton.isHidden = false; self.existingEnvironmentButton.isHidden = false }

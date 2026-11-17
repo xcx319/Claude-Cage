@@ -177,6 +177,20 @@ enum UpdatesTests {
         let probe = resources.appendingPathComponent("cage")
         try Data(script.utf8).write(to: probe)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: probe.path)
+        // A local or launcher build must not replace its features with the
+        // official workbench update, even when it uses the canonical App ID.
+        for (name, extra) in [("local", ["CageLocalBuild": true]), ("launcher", ["CageVMLauncher": true])] {
+            let manualBundle = root.appendingPathComponent("\(name)-manual.app")
+            let manualResources = manualBundle.appendingPathComponent("Contents/Resources")
+            try CageUpdateFiles.privateDirectory(manualResources)
+            try FileManager.default.copyItem(at: probe, to: manualResources.appendingPathComponent("cage"))
+            var info: [String: Any] = ["CFBundleIdentifier": cageUpdateBundleID, "CFBundlePackageType": "APPL", "CageVersion": "0.0.0"]
+            for (key, value) in extra { info[key] = value }
+            try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0).write(to: manualBundle.appendingPathComponent("Contents/Info.plist"))
+            let manual = CageAppUpdater(bundleURL: manualBundle, onChange: { _ in }, quit: {}, reconnect: {})
+            for action in ["check", "install", "status"] { try expect(manual.handle(action)["phase"] as? String == "manual", "local/launcher build uses manual updates") }
+            try expect(!FileManager.default.fileExists(atPath: countFile.path), "local/launcher build invoked official updater")
+        }
         #if arch(x86_64)
         // Real Intel bundles must never invoke the ARM64-only update channel.
         // The standalone process fixture below still verifies its retry protocol.

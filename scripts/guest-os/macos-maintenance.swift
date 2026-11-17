@@ -88,9 +88,13 @@ enum MacMaintenance {
 
     private static func verified(_ app: NSRunningApplication, identifiers: Set<String>? = nil) -> Bool {
         guard let bundle = app.bundleIdentifier, (identifiers ?? applications).contains(bundle) else { return false }
+        return verifiedProcess(app.processIdentifier, identifier: bundle)
+    }
+
+    private static func verifiedProcess(_ pid: pid_t, identifier: String) -> Bool {
         var code: SecCode?, requirement: SecRequirement?
-        return SecRequirementCreateWithString("anchor apple and identifier \"\(bundle)\"" as CFString, [], &requirement) == errSecSuccess &&
-            SecCodeCopyGuestWithAttributes(nil, [kSecGuestAttributePid as String: app.processIdentifier] as CFDictionary, [], &code) == errSecSuccess &&
+        return SecRequirementCreateWithString("anchor apple and identifier \"\(identifier)\"" as CFString, [], &requirement) == errSecSuccess &&
+            SecCodeCopyGuestWithAttributes(nil, [kSecGuestAttributePid as String: pid] as CFDictionary, [], &code) == errSecSuccess &&
             code != nil && requirement != nil && SecCodeCheckValidity(code!, [], requirement!) == errSecSuccess
     }
 
@@ -118,7 +122,7 @@ enum MacMaintenance {
             throw Failure(7, "maintenance_window_unavailable")
         }
         let display = CGDisplayBounds(CGMainDisplayID())
-        var covering: [(bounds: CGRect, pid: Int32?, window: UInt32?)] = []
+        var covering: [(bounds: CGRect, pid: Int32?, window: UInt32?, layer: Int)] = []
         for window in windows {
             guard let raw = window[kCGWindowBounds as String] as? [String: Any],
                   let bounds = CGRect(dictionaryRepresentation: raw as CFDictionary), bounds.width > 0, bounds.height > 0,
@@ -140,7 +144,10 @@ enum MacMaintenance {
                 if let blocker = covering.first(where: { $0.bounds.intersects(region) }) {
                     let bundle = blocker.pid.flatMap { NSRunningApplication(processIdentifier: $0)?.bundleIdentifier }
                     return ["error": "maintenance_window_obscured", "blocking_pid": blocker.pid ?? 0,
-                            "blocking_window": blocker.window ?? 0, "blocking_bundle": bundle ?? ""]
+                            "blocking_window": blocker.window ?? 0, "blocking_bundle": bundle ?? "",
+                            "blocking_layer": blocker.layer, "blocking_bounds": [blocker.bounds.minX, blocker.bounds.minY, blocker.bounds.width, blocker.bounds.height],
+                            "display_bounds": [display.minX, display.minY, display.width, display.height],
+                            "system_major": ProcessInfo.processInfo.operatingSystemVersion.majorVersion]
                 }
                 return ["version": 1, "session": session, "user": NSUserName(), "pid": target.processIdentifier,
                     "window": id, "bundle": target.bundleIdentifier!,
@@ -149,17 +156,17 @@ enum MacMaintenance {
                     "display": [display.minX, display.minY, display.width, display.height]]
             }
             if owner != front.processIdentifier {
-                #if arch(x86_64)
-                if let owner, let app = NSRunningApplication(processIdentifier: owner),
-                   let bundle = app.bundleIdentifier,
-                   macMaintenanceCompositorSurface(bundle: bundle,
-                       appleSigned: verified(app, identifiers: ["com.apple.dock", "com.apple.notificationcenterui"]),
+                // WindowServer 没有 NSRunningApplication bundle，仍须校验其动态代码签名。
+                let identity = app?.bundleIdentifier ?? "com.apple.WindowServer"
+                if let owner,
+                   macMaintenanceCompositorSurface(bundle: identity,
+                       appleSigned: true,
                        layer: window[kCGWindowLayer as String] as? Int ?? -1,
-                       bounds: bounds, display: display, systemMajor: ProcessInfo.processInfo.operatingSystemVersion.majorVersion) {
+                       bounds: bounds, display: display, systemMajor: ProcessInfo.processInfo.operatingSystemVersion.majorVersion),
+                   verifiedProcess(owner, identifier: identity) {
                     continue
                 }
-                #endif
-                covering.append((bounds, owner, window[kCGWindowNumber as String] as? UInt32))
+                covering.append((bounds, owner, window[kCGWindowNumber as String] as? UInt32, window[kCGWindowLayer as String] as? Int ?? -1))
             }
         }
         throw Failure(7, "maintenance_window_unavailable")

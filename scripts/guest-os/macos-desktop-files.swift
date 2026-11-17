@@ -47,6 +47,28 @@ private func filePanelFocused(_ panel: AXUIElement, pid: pid_t) -> Bool {
     return false
 }
 
+private func focusedFilePathField(_ pid: pid_t) -> AXUIElement? {
+    for owner in [AXUIElementCreateSystemWide(), AXUIElementCreateApplication(pid)] {
+        guard let raw = fileAttribute(owner, kAXFocusedUIElementAttribute), CFGetTypeID(raw) == AXUIElementGetTypeID() else { continue }
+        let element = raw as! AXUIElement
+        guard fileAttribute(element, "AXIdentifier") as? String == "PathTextField" else { continue }
+        var node: AXUIElement? = element
+        for _ in 0..<24 {
+            guard let current = node else { break }
+            if fileAttribute(current, "AXIdentifier") as? String == "GoToWindow" { return element }
+            guard let parent = fileAttribute(current, kAXParentAttribute), CFGetTypeID(parent) == AXUIElementGetTypeID() else { break }
+            node = (parent as! AXUIElement)
+        }
+    }
+    return nil
+}
+
+// The native Go To Folder editor can be a separate AX sheet, rather than a
+// descendant of the Open panel, while remaining in the same verified app.
+private func fileGoToFolderFocused(_ pid: pid_t) -> Bool {
+    focusedFilePathField(pid) != nil
+}
+
 private func containsFileBrowser(_ element: AXUIElement) -> Bool {
     var pending = fileChildren(element)
     var visited = 0
@@ -96,6 +118,62 @@ private func selectedFilePaths(_ panel: AXUIElement, expected: Set<String>) -> S
         selected.append(contentsOf: fileChildren(element))
     }
     return paths
+}
+
+// Select only a row whose native file URL resolves to the authorized path.
+private func selectProjectDirectory(_ panel: AXUIElement, expected: String) -> Bool {
+    var pending = [panel], visited = 0
+    while !pending.isEmpty && visited < 4096 {
+        let element = pending.removeLast(); visited += 1
+        var matches = false
+        for attribute in [kAXURLAttribute, kAXValueAttribute] {
+            let raw = fileAttribute(element, attribute)
+            let url = (raw as? URL) ?? (raw as? String).flatMap { $0.hasPrefix("/") ? URL(fileURLWithPath: $0) : URL(string: $0) }
+            if let url, url.isFileURL, let resolved = realpath(url.path, nil) {
+                matches = String(cString: resolved) == expected; free(resolved)
+                if matches { break }
+            }
+        }
+        if matches {
+            var node: AXUIElement? = element
+            for _ in 0..<8 {
+                guard let current = node, !CFEqual(current, panel) else { break }
+                guard let parent = fileAttribute(current, kAXParentAttribute), CFGetTypeID(parent) == AXUIElementGetTypeID() else { break }
+                let container = parent as! AXUIElement
+                let role = fileAttribute(container, kAXRoleAttribute) as? String ?? ""
+                // Column view items are AXGroups, not selectable AXRows. The
+                // list owns selection; changing a label's AXSelected is not a
+                // file selection and cannot complete NSOpenPanel.
+                if role == kAXListRole,
+                   AXUIElementSetAttributeValue(container, kAXSelectedChildrenAttribute as CFString, [current] as CFArray) == .success { return true }
+                if [kAXTableRole, kAXOutlineRole].contains(role),
+                   fileAttribute(current, kAXRoleAttribute) as? String == kAXRowRole,
+                   AXUIElementSetAttributeValue(container, kAXSelectedRowsAttribute as CFString, [current] as CFArray) == .success { return true }
+                node = container
+            }
+        }
+        pending.append(contentsOf: fileChildren(element))
+    }
+    return false
+}
+
+// A folder picker may enter the requested directory without selecting a row.
+// In that case verify the native path control, never a filename or arbitrary text.
+private func filePanelCurrentDirectory(_ panel: AXUIElement, expected: String) -> Bool {
+    var pending = [panel], visited = 0
+    while !pending.isEmpty && visited < 2048 {
+        let element = pending.removeLast(); visited += 1
+        let role = fileAttribute(element, kAXRoleAttribute) as? String ?? ""
+        if role == "AXPathControl" || role == kAXPopUpButtonRole || CFEqual(element, panel) {
+            if let url = fileAttribute(element, kAXURLAttribute) as? URL, url.isFileURL,
+               let resolved = realpath(url.path, nil) {
+                let actual = String(cString: resolved); free(resolved)
+                if actual == expected { return true }
+            }
+        }
+        pending.append(contentsOf: fileChildren(element))
+    }
+    return false
 }
 
 private func openFilePanel(_ pid: pid_t) -> AXUIElement? {
@@ -280,7 +358,7 @@ final class MacDesktopFiles {
         guard Date().timeIntervalSince(batch.created) < 1800, ownsFileWindow(batch.pid),
               NSWorkspace.shared.frontmostApplication?.processIdentifier == batch.pid else { throw Failure(7, "window_changed") }
         if let panel = batch.panel {
-            guard filePanelPresent(panel, pid: batch.pid), filePanelFocused(panel, pid: batch.pid) else { throw Failure(7, "file_dialog_changed") }
+            guard filePanelPresent(panel, pid: batch.pid), (filePanelFocused(panel, pid: batch.pid) || (batch.busy && fileGoToFolderFocused(batch.pid))) else { throw Failure(7, "file_dialog_changed") }
         } else {
             let windows = CGWindowListCopyWindowInfo([.optionIncludingWindow], batch.window) as? [[String: Any]]
             guard let window = windows?.first, window[kCGWindowOwnerPID as String] as? Int32 == batch.pid,
@@ -310,20 +388,23 @@ final class MacDesktopFiles {
         guard AXIsProcessTrusted(), ownsFileWindow(pid), NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {
             throw Failure(7, "window_changed")
         }
+        try consoleUser()
+        try MacGUISession.shared.validate(epoch)
+        guard panel.map({ filePanelPresent($0, pid: pid) && (filePanelFocused($0, pid: pid) || fileGoToFolderFocused(pid)) }) ?? true else { throw Failure(7, "file_dialog_changed") }
         let source = CGEventSource(stateID: .privateState)
-        for down in [true, false] {
-            try consoleUser()
-            try MacGUISession.shared.validate(epoch)
-            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
-                  panel.map({ filePanelPresent($0, pid: pid) && filePanelFocused($0, pid: pid) }) ?? true else { throw Failure(7, "file_dialog_changed") }
-            guard let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else { throw Failure(8, "input_failed") }
-            event.flags = flags
-            if panel != nil {
-                // AppKit's Open/Save panel runs in an XPC service. Events sent
-                // only to the application PID do not reach its focused panel.
-                guard CGPreflightPostEventAccess() else { throw Failure(9, "accessibility_permission") }
-                event.post(tap: .cghidEventTap)
-            } else { event.postToPid(pid) }
+        guard let down = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: false) else { throw Failure(8, "input_failed") }
+        down.flags = flags
+        up.flags = []
+        // A shortcut may legitimately move focus into the Go To Folder sheet.
+        // Once pressed, always release it, even when that focus changes.
+        if panel != nil {
+            guard CGPreflightPostEventAccess() else { throw Failure(9, "accessibility_permission") }
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
+        } else {
+            down.postToPid(pid)
+            up.postToPid(pid)
         }
     }
 
@@ -361,6 +442,62 @@ final class MacDesktopFiles {
         let value = try batch(id)
         guard !value.busy else { throw Failure(8, "attachment_busy") }
         return ["ok": true]
+    }
+
+    // The host resolves this path from an explicitly authorized project.
+    // Never let this API select an arbitrary guest directory.
+    func directory(_ id: String, path: String) async throws -> [String: Any] {
+        let value = try batch(id)
+        let prefix = NSHomeDirectory() + "/Cage/Projects/"
+        guard value.kind == "chooser", !value.busy, let panel = value.panel,
+              (try? claudePIDs().contains(value.pid)) == true,
+              path.hasPrefix(prefix),
+              String(path.dropFirst(prefix.count)).range(of: "^[0-9a-f]{24}$", options: .regularExpression) != nil else {
+            throw Failure(8, "project_directory_invalid")
+        }
+        var info = stat()
+        guard lstat(path, &info) == 0, info.st_mode & S_IFMT == S_IFDIR else { throw Failure(7, "project_directory_invalid") }
+        value.busy = true
+        defer { value.busy = false }
+        try key(value.pid, 5, flags: [.maskCommand, .maskShift], panel: panel, epoch: value.epoch)
+        var field: AXUIElement?
+        for _ in 0..<20 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            guard batches[id] === value else { throw Failure(8, "attachment_cancelled") }
+            try valid(value)
+            if let focused = focusedFilePathField(value.pid) { field = focused; break }
+        }
+        guard let field, AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, (path as NSString).deletingLastPathComponent as CFString) == .success else {
+            throw Failure(7, "file_dialog_navigation_failed")
+        }
+        try key(value.pid, 36, panel: panel, epoch: value.epoch)
+        for _ in 0..<20 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            guard batches[id] === value else { throw Failure(8, "attachment_cancelled") }
+            try valid(value)
+            if focusedFilePathField(value.pid) == nil { break }
+        }
+        guard let resolved = realpath(path, nil) else { throw Failure(7, "file_dialog_selection_mismatch") }
+        let expected = String(cString: resolved); free(resolved)
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            try valid(value)
+            _ = selectProjectDirectory(panel, expected: expected)
+            if selectedFilePaths(panel, expected: [expected]) == [expected] { break }
+        }
+        let selected = selectedFilePaths(panel, expected: [expected])
+        guard (selected == [expected] || (selected.isEmpty && filePanelCurrentDirectory(panel, expected: expected))), let button = filePanelButton(panel),
+              fileAttribute(button, kAXEnabledAttribute) as? Bool == true,
+              AXUIElementPerformAction(button, kAXPressAction as CFString) == .success else {
+            throw Failure(7, "file_dialog_selection_mismatch")
+        }
+        for _ in 0..<20 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if let current = openFilePanel(value.pid), CFEqual(current, panel) { continue }
+            batches.removeValue(forKey: id)
+            return ["ok": true]
+        }
+        throw Failure(7, "file_dialog_still_open")
     }
 
     func cancel(_ id: String) async -> [String: Any] {

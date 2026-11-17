@@ -177,20 +177,25 @@ enum MacSetupPassword {
             throw Failure(7, "setup_password_window_unavailable")
         }
         let display = CGDisplayBounds(CGMainDisplayID())
-        var trustedSurfaces: [pid_t: Bool] = [:]
         let windows = raw.compactMap { item -> Window? in
             guard let id = item[kCGWindowNumber as String] as? UInt32, let pid = item[kCGWindowOwnerPID as String] as? Int32,
                   let rectangle = item[kCGWindowBounds as String] as? [String: Any], let bounds = CGRect(dictionaryRepresentation: rectangle as CFDictionary),
                   bounds.width > 0, bounds.height > 0, (item[kCGWindowAlpha as String] as? Double ?? 1) > 0,
                   let layer = item[kCGWindowLayer as String] as? Int else { return nil }
             var surface = false
+            if let app = NSRunningApplication(processIdentifier: pid), let owner = app.bundleIdentifier,
+               owner == "com.apple.WindowServer", signed(app, bundle: owner) {
+                surface = macMaintenanceCompositorSurface(bundle: owner, appleSigned: true, layer: layer,
+                                                          bounds: bounds, display: display,
+                                                          systemMajor: ProcessInfo.processInfo.operatingSystemVersion.majorVersion)
+            }
             if layer > 0, abs(bounds.minX - display.minX) < 1, abs(bounds.minY - display.minY) < 1,
                abs(bounds.width - display.width) < 1, abs(bounds.height - display.height) < 1 {
-                if let cached = trustedSurfaces[pid] { surface = cached }
-                else {
-                    if let app = NSRunningApplication(processIdentifier: pid), let owner = app.bundleIdentifier,
-                       ["com.apple.dock", "com.apple.notificationcenterui"].contains(owner) { surface = signed(app, bundle: owner) }
-                    trustedSurfaces[pid] = surface
+                if let app = NSRunningApplication(processIdentifier: pid), let owner = app.bundleIdentifier,
+                   ["com.apple.dock", "com.apple.notificationcenterui"].contains(owner) {
+                    surface = macMaintenanceCompositorSurface(bundle: owner, appleSigned: signed(app, bundle: owner), layer: layer,
+                                                              bounds: bounds, display: display,
+                                                              systemMajor: ProcessInfo.processInfo.operatingSystemVersion.majorVersion)
                 }
             }
             return Window(id: id, pid: pid, bounds: bounds, layer: layer, systemSurface: surface)

@@ -81,7 +81,7 @@ function desktopFilesPollDelay(failures, windowVisible) {
   return Math.min((windowVisible ? 1500 : 4500) * 2 ** Math.min(failures, 4), 15000);
 }
 
-export function useDesktopFiles(ready, onStatus, desktopVisible, windowVisible = true) {
+export function useDesktopFiles(ready, onStatus, desktopVisible, windowVisible = true, automaticChooser = true) {
   const connection = getClientContext().connection_id;
   const windowShown = useRef(windowVisible);
   windowShown.current = windowVisible;
@@ -117,7 +117,7 @@ export function useDesktopFiles(ready, onStatus, desktopVisible, windowVisible =
           });
         for (const request of value.uploads || []) {
           if (disposed || !viewVisible.current || !nativeAvailable()) break;
-          if (request.directory || (request.kind && request.kind !== "chooser") || handled.has(request.id)) continue;
+          if (!automaticChooser || request.directory || (request.kind && request.kind !== "chooser") || handled.has(request.id)) continue;
           const body = { target: "desktop", id: request.id };
           try {
             assertConnection(connection);
@@ -180,7 +180,7 @@ export function useDesktopFiles(ready, onStatus, desktopVisible, windowVisible =
       wake.current = null;
       clearTimeout(timer);
     };
-  }, [ready, connection]);
+  }, [ready, connection, automaticChooser]);
   return files;
 }
 

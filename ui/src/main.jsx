@@ -62,8 +62,10 @@ import { AppUpdateButton, useAppUpdates } from "./app-updates";
 import "./appearance.css";
 import { stopAndExit } from "./quit";
 import { guestCapability } from "./guest-capabilities.mjs";
+import { VMLauncher } from "./vm-launcher";
+import { NativeDesktopLifetime } from "./native-desktop";
 
-function App() {
+function App({ onLauncher }) {
   const { account } = useAccount();
   const [, refreshClientPreferences] = useState(0);
   useEffect(() => {
@@ -320,7 +322,7 @@ function App() {
     window.cageSyncClipboard = () => clipboard.sync();
     return () => { clipboard.dispose(); delete window.cageSyncClipboard; };
   }, [status?.ready, clipboardAvailable, clipboardConnection]);
-  const desktopFiles = useDesktopFiles(Boolean(status?.ready && desktopAvailable), notify, desktopOpen && !settingsOpen && !managementPage && !storageRecovery && windowVisible, windowVisible);
+  const desktopFiles = useDesktopFiles(Boolean(status?.ready && desktopAvailable), notify, desktopOpen && !settingsOpen && !managementPage && !storageRecovery && windowVisible, windowVisible, !macGuest);
   const downloads = [...(browser.downloads || []), ...desktopFiles.downloads];
   useDownloadNotifications(downloads, notify, Boolean(browser.uploads?.length || desktopFiles.uploads.length));
   const refreshSettings = async () => {
@@ -1448,6 +1450,7 @@ function App() {
       >
         {!sidebarCollapsed && (
           <WorkspaceSidebar
+            onLauncher={onLauncher}
             onClaudeAccounts={() => setManagementPage("claude-accounts")}
             claudeAccountsOpen={managementPage === "claude-accounts"}
             tailscaleOpen={managementPage === "tailscale"}
@@ -1564,7 +1567,7 @@ function App() {
           <main className={`workspace ${split ? "workspace-split" : ""}`} ref={workspaceBox} hidden={Boolean(managementPage)}
             style={{ "--split-left": `${100 * (dualBrowser && nativeSplit?.fraction || 0.5)}%` }}>
             {dropSide && <div aria-hidden="true" className={`split-drop split-${dropSide}`}>{dropSide === "left" ? "放到左侧" : "放到右侧"}</div>}
-            {!storageRecovery && desktopOpen && macGuest && <MacOSAppWindow key="claude-desktop" uploads={desktopFiles.uploads} keyboard={status.keyboard} remoteRef={remote}
+            {!storageRecovery && desktopOpen && macGuest && <MacOSAppWindow key="claude-desktop" uploads={desktopFiles.uploads} status={status} onProjectOpened={() => refreshStatus.current?.()} keyboard={status.keyboard} remoteRef={remote}
               onStatus={notify} onFallback={(text, message) => setTransfer({ text, message })} visible={!settingsOpen && !managementPage} onConfirm={confirm}
               sidebarCollapsed={sidebarCollapsed} onExpand={() => persist("cage-sidebar-collapsed", false, setSidebarCollapsed)} />}
             {!storageRecovery && desktopOpen && !macGuest && <ClaudeDesktop
@@ -2100,6 +2103,12 @@ function App() {
     </SafetyChecklistContext.Provider>
   );
 }
+function WorkbenchMode() {
+  const [launcher, setLauncher] = useState(Boolean(window.cageVMLauncherPreferred));
+  return <NativeDesktopLifetime>{launcher
+    ? <VMLauncher onWorkbench={() => setLauncher(false)} />
+    : <App onLauncher={() => setLauncher(true)} />}</NativeDesktopLifetime>;
+}
 export default function Workbench() {
-  return <AccountProvider><AppearanceProvider><AccountGate><InitializationGate><App /></InitializationGate></AccountGate></AppearanceProvider></AccountProvider>;
+  return <AccountProvider><AppearanceProvider><AccountGate><InitializationGate><WorkbenchMode /></InitializationGate></AccountGate></AppearanceProvider></AccountProvider>;
 }

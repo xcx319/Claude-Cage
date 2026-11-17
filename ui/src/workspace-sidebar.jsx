@@ -1,3 +1,4 @@
+import { NativeDesktopButton } from "./native-desktop";
 import { shortcut } from "./platform.mjs";
 import React, { useEffect, useRef, useState } from "react";
 import {
@@ -56,6 +57,7 @@ export function WorkspaceSidebar({
   runtimeLabel,
   network,
   onHome,
+  onLauncher,
   browserAvailable = true,
   editorAvailable = true,
   projectsAvailable = true,
@@ -145,6 +147,8 @@ export function WorkspaceSidebar({
         </div>
         <button className={`sidebar-link ${tailscaleOpen ? "selected" : ""}`} aria-current={tailscaleOpen ? "page" : undefined} onClick={onTailscale} aria-label="打开 Tailscale"><Network size={17} />Tailscale</button>
         {ssh && <button className="sidebar-link ssh-navigation" onClick={ssh.open} aria-label="SSH 主机"><Server size={17} />SSH</button>}
+        {guestSystem === "macos" && <button className="sidebar-link" onClick={onLauncher}><Monitor size={17} />虚拟机启动器</button>}
+        {guestSystem === "macos" && <NativeDesktopButton ready={running && !busy} onStatus={onAccountStatus} />}
         <button className={`sidebar-link ${desktopOpen ? "selected" : ""}`} onClick={onClaudeDesktop} disabled={!running || busy} title="安装或打开 Claude Desktop"><Monitor size={17} />Claude Desktop</button>
         <button className={`sidebar-link ${claudeAccountsOpen ? "selected" : ""}`} onClick={onClaudeAccounts}
           aria-current={claudeAccountsOpen ? "page" : undefined}>

@@ -6,6 +6,84 @@
 
 static VZVirtualMachine *machine;
 static CageGuestSetupView *loginView;
+static NSWindow *desktopWindow;
+static VZVirtualMachineView *desktopView;
+
+// VZ's Mac keyboard uses device-specific modifier bits as well as AppKit's
+// aggregate flags. App-scoped input tools may supply only the latter.
+static NSEvent *desktopKeyboardEvent(NSEvent *event) {
+    BOOL flagsOnly = event.type == NSEventTypeFlagsChanged;
+    NSEventModifierFlags flags = event.modifierFlags;
+    if (flags & NSEventModifierFlagShift) flags |= NX_DEVICELSHIFTKEYMASK;
+    if (flags & NSEventModifierFlagControl) flags |= NX_DEVICELCTLKEYMASK;
+    if (flags & NSEventModifierFlagOption) flags |= NX_DEVICELALTKEYMASK;
+    if (flags & NSEventModifierFlagCommand) flags |= NX_DEVICELCMDKEYMASK;
+    return [NSEvent keyEventWithType:event.type location:event.locationInWindow modifierFlags:flags
+        timestamp:event.timestamp windowNumber:event.windowNumber context:nil
+        characters:flagsOnly ? @"" : event.characters ?: @"" charactersIgnoringModifiers:flagsOnly ? @"" : event.charactersIgnoringModifiers ?: @""
+        isARepeat:!flagsOnly && event.isARepeat keyCode:event.keyCode];
+}
+@interface CageDesktopView : VZVirtualMachineView {
+    NSEventModifierFlags _guestModifiers;
+}
+@end
+@implementation CageDesktopView
+- (BOOL)acceptsFirstResponder { return YES; }
+- (BOOL)acceptsFirstMouse:(NSEvent *)event { return YES; }
+- (void)syncModifiers:(NSEventModifierFlags)flags {
+    const NSEventModifierFlags bits[] = { NSEventModifierFlagShift, NSEventModifierFlagControl, NSEventModifierFlagOption, NSEventModifierFlagCommand };
+    const unsigned short codes[] = {56,59,58,55};
+    for (int i=0;i<4;i++) {
+        if ((_guestModifiers & bits[i]) == (flags & bits[i])) continue;
+        BOOL down = (flags & bits[i]) != 0;
+        if (down) _guestModifiers |= bits[i]; else _guestModifiers &= ~bits[i];
+        NSEvent *change = [NSEvent keyEventWithType:NSEventTypeFlagsChanged location:NSZeroPoint modifierFlags:_guestModifiers
+            timestamp:NSProcessInfo.processInfo.systemUptime windowNumber:self.window.windowNumber context:nil characters:@"" charactersIgnoringModifiers:@"" isARepeat:NO keyCode:codes[i]];
+        [super flagsChanged:desktopKeyboardEvent(change)];
+        NSEvent *physical = [NSEvent keyEventWithType:down ? NSEventTypeKeyDown : NSEventTypeKeyUp location:NSZeroPoint modifierFlags:_guestModifiers
+            timestamp:change.timestamp windowNumber:change.windowNumber context:nil characters:@"" charactersIgnoringModifiers:@"" isARepeat:NO keyCode:codes[i]];
+        if (down) [super keyDown:desktopKeyboardEvent(physical)]; else [super keyUp:desktopKeyboardEvent(physical)];
+    }
+}
+- (void)keyDown:(NSEvent *)event { [self syncModifiers:event.modifierFlags]; [super keyDown:desktopKeyboardEvent(event)]; }
+- (void)keyUp:(NSEvent *)event { [super keyUp:desktopKeyboardEvent(event)]; [self syncModifiers:event.modifierFlags]; }
+- (void)flagsChanged:(NSEvent *)event { [self syncModifiers:event.modifierFlags]; [super flagsChanged:desktopKeyboardEvent(event)]; }
+- (void)resetGuestModifiers { [self syncModifiers:0]; }
+@end
+
+@interface CageNativeApplication : NSApplication
+@end
+@implementation CageNativeApplication
+- (void)sendEvent:(NSEvent *)event {
+    BOOL keyboard = event.type == NSEventTypeKeyDown || event.type == NSEventTypeKeyUp || event.type == NSEventTypeFlagsChanged;
+    BOOL targeted = desktopWindow && (event.window == desktopWindow || (!event.window && keyboard && self.keyWindow == desktopWindow));
+    // VZ's local event monitor consumes app-scoped modifier events before the
+    // window responder receives them. Deliver keys through its public view API.
+    if (keyboard && targeted && desktopView) {
+        if (event.type == NSEventTypeKeyDown) [desktopView keyDown:event];
+        else if (event.type == NSEventTypeKeyUp) [desktopView keyUp:event];
+        else [desktopView flagsChanged:event];
+        return;
+    }
+    [super sendEvent:event];
+}
+@end
+
+@interface CageDesktopDelegate : NSObject <NSWindowDelegate>
+@end
+@implementation CageDesktopDelegate
+- (void)windowDidResignKey:(NSNotification *)notification {
+    [(CageDesktopView *)desktopView resetGuestModifiers];
+}
+- (void)windowWillClose:(NSNotification *)notification {
+    [(CageDesktopView *)desktopView resetGuestModifiers];
+    desktopView.virtualMachine = nil;
+    desktopWindow.contentView = nil;
+    desktopView = nil;
+    desktopWindow = nil;
+}
+@end
+static CageDesktopDelegate *desktopDelegate;
 // Match the virtual Mac's scanout. The input protocol retains its original
 // 16:10 coordinate system, regardless of host window size or display scaling.
 static const CGFloat scanWidth = 1920, scanHeight = 1200;
@@ -13,11 +91,48 @@ static const CGFloat scanWidth = 1920, scanHeight = 1200;
 void cageLoginLoop(void *ref) {
     @autoreleasepool {
         machine = (__bridge VZVirtualMachine *)ref;
-        NSApplication *app = [NSApplication sharedApplication];
+        NSApplication *app = [CageNativeApplication sharedApplication];
         [app setActivationPolicy:NSApplicationActivationPolicyProhibited];
         [app run];
-        [loginView close]; loginView = nil; machine = nil;
+        [desktopWindow close]; [loginView close]; loginView = nil; machine = nil;
     }
+}
+bool cageDesktopOpen(void) {
+    __block BOOL ok = NO;
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        if (!machine) return;
+        if (desktopWindow) { [desktopWindow makeKeyAndOrderFront:nil]; ok = YES; return; }
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        NSRect rect = NSMakeRect(0, 0, 1200, 750);
+        desktopWindow = [[NSWindow alloc] initWithContentRect:rect
+            styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable
+            backing:NSBackingStoreBuffered defer:NO];
+        desktopWindow.releasedWhenClosed = NO;
+        desktopWindow.title = @"Cage Dev — 虚拟 Mac 桌面";
+        desktopWindow.contentAspectRatio = NSMakeSize(1920, 1200);
+        desktopWindow.minSize = NSMakeSize(640, 400);
+        desktopView = [[CageDesktopView alloc] initWithFrame:rect];
+        desktopView.virtualMachine = machine;
+        desktopView.capturesSystemKeys = YES;
+        desktopView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        desktopWindow.contentView = desktopView;
+        desktopDelegate = [CageDesktopDelegate new];
+        desktopWindow.delegate = desktopDelegate;
+        [desktopWindow center];
+        [desktopWindow makeKeyAndOrderFront:nil];
+        [desktopWindow makeFirstResponder:desktopView];
+        [NSApp activateIgnoringOtherApps:YES];
+        ok = YES;
+    });
+    return ok;
+}
+void cageDesktopClose(void) {
+    dispatch_sync(dispatch_get_main_queue(), ^{ [desktopWindow close]; });
+}
+bool cageDesktopIsOpen(void) {
+    __block BOOL result;
+    dispatch_sync(dispatch_get_main_queue(), ^{ result = desktopWindow != nil; });
+    return result;
 }
 void cageLoginStop(void) {
     dispatch_async(dispatch_get_main_queue(), ^{

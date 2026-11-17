@@ -4,10 +4,29 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
 	"time"
 )
+
+// Record event categories only; never log coordinates, text, or window IDs.
+func macOSInputMetric(input macOSWindowRequest, response []byte) string {
+	name := input.Action
+	if name == "pointer" || name == "browser-pointer" {
+		name += "-" + input.Phase
+		if input.Phase == "move" && input.Buttons != 0 {
+			name += "-held"
+		}
+	}
+	var reply struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(response, &reply) == nil && reply.Error != "" {
+		name += "-error"
+	}
+	return name
+}
 
 func validMacOSWindowRequest(input macOSWindowRequest) bool {
 	switch input.Action {
@@ -110,6 +129,8 @@ func (s *Server) macOSWindowConnection(w http.ResponseWriter, r *http.Request) {
 	scanner := bufio.NewScanner(output)
 	scanner.Buffer(make([]byte, 64<<10), 12<<20)
 	metrics := newInputMetrics(s.recordInputMetrics)
+	var dragMoves, dragHeld int
+	var dragging, dragFailed bool
 	for {
 		var message struct {
 			ID      uint64             `json:"id"`
@@ -143,11 +164,35 @@ func (s *Server) macOSWindowConnection(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		timer.Stop()
-		metrics.observe(message.Request.Action, time.Since(requested))
 		data := append(json.RawMessage(nil), scanner.Bytes()...)
 		if !json.Valid(data) {
 			return
 		}
+		if message.Request.Action == "pointer" || message.Request.Action == "browser-pointer" {
+			var response struct {
+				Error string `json:"error"`
+			}
+			_ = json.Unmarshal(data, &response)
+			switch message.Request.Phase {
+			case "down":
+				dragging, dragFailed, dragMoves, dragHeld = true, response.Error != "", 0, 0
+			case "move":
+				if dragging {
+					dragMoves++
+					if message.Request.Buttons != 0 {
+						dragHeld++
+					}
+					dragFailed = dragFailed || response.Error != ""
+				}
+			case "up":
+				if dragging {
+					dragFailed = dragFailed || response.Error != ""
+					s.recordInputMetrics(fmt.Sprintf("drag moves=%d held=%d error=%t", dragMoves, dragHeld, dragFailed))
+					dragging = false
+				}
+			}
+		}
+		metrics.observe(macOSInputMetric(message.Request, data), time.Since(requested))
 		_ = ws.SetWriteDeadline(time.Now().Add(12 * time.Second))
 		if ws.WriteJSON(struct {
 			ID     uint64          `json:"id"`

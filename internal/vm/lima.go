@@ -636,6 +636,21 @@ func (l *Lima) Start(ctx context.Context, name string, log io.Writer) error {
 		return err
 	}
 	var guestAgent string
+	var nativeRunner string
+	if runtime.GOOS == "darwin" && *inst.Config.OS == limatype.DARWIN {
+		// A proper helper bundle gives the visible VZ desktop its own application
+		// identity. It still runs the same hostagent with the same VM configuration.
+		if executable, e := os.Executable(); e == nil {
+			bundle := filepath.Join(filepath.Dir(executable), "CageVM.app")
+			runner := filepath.Join(bundle, "Contents", "MacOS", "cage")
+			if info, e := os.Lstat(runner); e == nil && info.Mode().IsRegular() && info.Mode().Perm()&0111 != 0 {
+				if e := exec.CommandContext(ctx, "/usr/bin/codesign", "--verify", "--strict", bundle).Run(); e != nil {
+					return fmt.Errorf("native desktop runner signature: %w", e)
+				}
+				nativeRunner = runner
+			}
+		}
+	}
 	// Lima always needs the Darwin helper for first boot. Windows and FreeBSD
 	// have no guest agent, and Linux plain mode works without one.
 	if *inst.Config.OS == limatype.DARWIN || (*inst.Config.OS == limatype.LINUX && !*inst.Config.Plain) {
@@ -649,7 +664,7 @@ func (l *Lima) Start(ctx context.Context, name string, log io.Writer) error {
 			return err
 		}
 		started := time.Now()
-		return vmStartError(instance.StartWithPaths(ctx, inst, false, false, "", guestAgent), inst.Dir, started)
+		return vmStartError(instance.StartWithPaths(ctx, inst, false, false, nativeRunner, guestAgent), inst.Dir, started)
 	})
 }
 

@@ -30,7 +30,7 @@ func macOSWorkbenchRoute(path string) bool {
 		return id == "requests" || id == "open" || browserFileID.MatchString(id)
 	}
 	switch path {
-	case "/api/environment/macos-screen-sharing", "/api/macos/first-setup", "/api/appearance/codex", "/api/macos/project-approval", "/api/macos/exit-policy", "/api/macos/login", "/api/macos/maintenance":
+	case "/api/environment/macos-screen-sharing", "/api/macos/first-setup", "/api/appearance/codex", "/api/macos/project-approval", "/api/macos/exit-policy", "/api/macos/login", "/api/macos/maintenance", "/api/macos/native-desktop":
 		return true
 	}
 	return strings.HasPrefix(path, "/api/macos/claude/") || strings.HasPrefix(path, "/api/macos-browser/")
@@ -176,8 +176,20 @@ func (s *Server) checkMacOSComponents() {
 func (s *Server) attachMacOSGuest() error {
 	ctx, cancel := s.controlContext()
 	defer cancel()
+	return s.attachMacOSGuestContext(ctx)
+}
+
+func (s *Server) attachMacOSGuestContext(ctx context.Context) error {
+	s.mu.Lock()
+	wasReady := s.ready
+	s.mu.Unlock()
 	err := s.checkMacOSGuest(ctx)
-	if err == nil {
+	// Creation preferences persist in the guest. Do not enqueue another
+	// profile write on every health tick: it shares the GUI service's mutation
+	// queue with slow browser operations and can falsely disconnect a healthy
+	// VM. Real identity/gate probes still run on every tick, and a fresh attach
+	// after startup, maintenance or a lost guest connection synchronizes again.
+	if err == nil && !wasReady {
 		err = s.syncNativeBrowserProfile(ctx)
 	}
 	s.mu.Lock()
@@ -233,7 +245,12 @@ func (s *Server) startMacOSGuest() error {
 	if err := s.syncMacGuestPassword(s.operationContext()); err != nil {
 		return err
 	}
-	if err := s.attachMacOSGuest(); err != nil {
+	// The VM's SSH-ready signal precedes the user's GUI browser service.
+	// Explicit startup waits for that service; periodic health probes retain
+	// their short controlContext budget and all network checks still follow.
+	ctx, cancel := context.WithTimeout(s.operationContext(), 30*time.Second)
+	defer cancel()
+	if err := s.attachMacOSGuestContext(ctx); err != nil {
 		return err
 	}
 	return s.checkNetworkIfWanted()

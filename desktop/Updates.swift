@@ -282,6 +282,15 @@ final class CageAppUpdater {
         }
     }
     func handle(_ operation: String) -> [String: Any] {
+        let bundle = Bundle(url: bundleURL)
+        if bundle?.bundleIdentifier?.hasPrefix(cageUpdateBundleID + ".dev") == true ||
+            bundle?.object(forInfoDictionaryKey: "CageLocalBuild") as? Bool == true ||
+            bundle?.object(forInfoDictionaryKey: "CageVMLauncher") as? Bool == true {
+            if state["phase"] as? String != "manual" {
+                change(["phase": "manual", "message": "此独立构建通过手动安装更新，以保留本机改造。"])
+            }
+            return state
+        }
         if Bundle(url: bundleURL)?.bundleIdentifier == cageUpdateBundleID + ".intel-macos-test" {
             if state["phase"] as? String != "manual" {
                 change(["phase": "manual", "message": "Intel 测试版通过独立测试包更新。"])

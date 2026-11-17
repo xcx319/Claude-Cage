@@ -248,6 +248,12 @@ func sendInput(_ input: Request, window: SCWindow, canvas: ClaudeCanvas? = nil, 
             if input.surface == "browser" {
                 guard try MacChromeWindow.shared.ownsPoint(point, pid: pid, window: window.windowID) else { throw Failure(7, "window_changed") }
                 event.post(tap: .cghidEventTap)
+            } else if input.action == "scroll" {
+                // Electron's scroll handling requires a system wheel event.
+                // Keep the same foreground and point ownership checks used by
+                // the desktop's physical pointer path.
+                guard macDesktopOwnsPoint(point, target: target, window: window) else { throw Failure(7, "window_changed") }
+                event.post(tap: .cghidEventTap)
             } else { event.postToPid(pid) }
         }
     default: throw Failure(8, "invalid_input")
@@ -299,6 +305,8 @@ private func handle(_ input: Request, inputSession: MacWindowInputSession) async
         return try MacDesktopFiles.shared.validate(input.id ?? "")
     case "files-finish":
         return try await MacDesktopFiles.shared.finish(input.id ?? "")
+    case "files-directory":
+        return try await MacDesktopFiles.shared.directory(input.id ?? "", path: input.path ?? "")
     case "files-finish-image":
         return try await MacDesktopFiles.shared.finishImage(input.id ?? "")
     case "files-cancel":
@@ -366,44 +374,69 @@ private func handle(_ input: Request, inputSession: MacWindowInputSession) async
         if input.wait != true && input.refresh != true && !browser && canvas.stream.unchanged(after: input.after) {
             return ["unchanged": true, "sequence": input.after!]
         }
-        if let width=input.width, let height=input.height, let scale=input.scale,
-           let cached = canvas.cachedTarget(width:width, height:height, scale:scale) {
-            do {
-                var reply = try await canvas.capture(cached.0, filter:cached.1, layout:cached.2, after:input.after, wait:input.wait == true, binary:input.binary == true)
-                try consoleUser()
-                reply["targetMs"] = 0; reply["layoutMs"] = 0; reply["cached"] = true
-                return reply
-            } catch {
-                canvas.forgetTarget()
-                throw error
-            }
-        }
-        let targetStarted = Date()
-        let (window, filter) = try await targetWindow()
-        let targetMs = (Date().timeIntervalSince(targetStarted) * 1000).rounded()
         if input.width != nil || input.height != nil || input.scale != nil {
             guard let width=input.width, let height=input.height, let scale=input.scale else { throw Failure(8,"invalid_input") }
-            let layoutStarted = Date()
-            let capture = filter ?? SCContentFilter(desktopIndependentWindow: window)
-            let layout = try await canvas.layout(window, filter:capture, width:width, height:height, scale:scale)
-            // A window object from before AX resizing still describes the old
-            // surface. Reacquire that exact window before the first new frame.
-            var target = window, source = capture
-            if abs(window.frame.width - layout.frame.width) >= 1 || abs(window.frame.height - layout.frame.height) >= 1 {
-                let (fresh, selection) = try await targetWindow(fresh: true)
-                guard fresh.windowID == layout.id, fresh.owningApplication?.processID == layout.pid else {
-                    throw Failure(7, "window_changed")
+            var original: (id: CGWindowID, pid: pid_t)?
+            do {
+                return try await MacCanvasFrameConvergence.run { (recovery: MacCanvasCropChanged?) async throws -> [String:Any] in
+                    if let recovery {
+                        guard let original else { throw Failure(7, "window_changed") }
+                        try canvas.requireCropRecovery(recovery, window: original.id, pid: original.pid)
+                    }
+                    if recovery == nil, let cached = canvas.cachedTarget(width:width, height:height, scale:scale) {
+                        original = (cached.2.id, cached.2.pid)
+                        do {
+                            var reply = try await canvas.capture(cached.0, filter:cached.1, layout:cached.2, after:input.after,
+                                                                 wait:input.wait == true, binary:input.binary == true, allowCropRecovery:true)
+                            try consoleUser()
+                            try canvas.requirePublishedLayout(cached.2, geometry:reply["geometry"] as? String)
+                            canvas.validatedInputTarget(cached.0, layout:cached.2, geometry:reply["geometry"] as? String)
+                            reply["targetMs"] = 0; reply["layoutMs"] = 0; reply["cached"] = true
+                            return reply
+                        } catch {
+                            canvas.forgetTarget(ifMatching: cached.2)
+                            throw error
+                        }
+                    }
+                    let targetStarted = Date()
+                    let (window, filter) = try await targetWindow(fresh: true)
+                    guard let pid = window.owningApplication?.processID else { throw Failure(7, "window_changed") }
+                    if let original {
+                        guard window.windowID == original.id, pid == original.pid, let recovery else { throw Failure(7, "window_changed") }
+                        try canvas.requireCropRecovery(recovery, window: original.id, pid: original.pid)
+                    } else { original = (window.windowID, pid) }
+                    let targetMs = (Date().timeIntervalSince(targetStarted) * 1000).rounded()
+                    let layoutStarted = Date()
+                    let capture = filter ?? SCContentFilter(desktopIndependentWindow: window)
+                    let layout = try await canvas.layout(window, filter:capture, width:width, height:height, scale:scale, recovery:recovery)
+                    // Reacquire the exact window after AX resize or repositioning.
+                    var target = window, source = capture
+                    if abs(window.frame.minX - layout.frame.minX) >= 1 || abs(window.frame.minY - layout.frame.minY) >= 1 ||
+                       abs(window.frame.width - layout.frame.width) >= 1 || abs(window.frame.height - layout.frame.height) >= 1 {
+                        let (fresh, selection) = try await targetWindow(fresh: true)
+                        guard fresh.windowID == layout.id, fresh.owningApplication?.processID == layout.pid else {
+                            throw Failure(7, "window_changed")
+                        }
+                        target = fresh
+                        source = selection ?? SCContentFilter(desktopIndependentWindow: fresh)
+                    }
+                    let layoutMs = (Date().timeIntervalSince(layoutStarted) * 1000).rounded()
+                    if recovery != nil { try canvas.requireCropRecoveryTarget(window: layout.id, pid: layout.pid) }
+                    var reply = try await canvas.capture(target, filter:source, layout:layout, after:input.after,
+                                                         wait:input.wait == true, binary:input.binary == true, allowCropRecovery:true)
+                    try consoleUser()
+                    try canvas.requirePublishedLayout(layout, geometry:reply["geometry"] as? String)
+                    if recovery != nil { try canvas.requireCropRecoveryTarget(window: layout.id, pid: layout.pid) }
+                    canvas.remember(target, filter:source, layout:layout, width:width, height:height, scale:scale, geometry:reply["geometry"] as? String)
+                    reply["targetMs"] = targetMs; reply["layoutMs"] = layoutMs
+                    return reply
                 }
-                target = fresh
-                source = selection ?? SCContentFilter(desktopIndependentWindow: fresh)
+            } catch MacCanvasFrameConvergence.Problem.unstable {
+                GuestDiagnostic.record("window", "capture_crop_unstable")
+                throw Failure(7, "window_changed")
             }
-            let layoutMs = (Date().timeIntervalSince(layoutStarted) * 1000).rounded()
-            var reply = try await canvas.capture(target, filter:source, layout:layout, after:input.after, wait:input.wait == true, binary:input.binary == true)
-            try consoleUser()
-            canvas.remember(target, filter:source, layout:layout, width:width, height:height, scale:scale)
-            reply["targetMs"] = targetMs; reply["layoutMs"] = layoutMs
-            return reply
         }
+        let (window, filter) = try await targetWindow()
         let data = try await screenshot(window, filter: filter)
         guard data.count < 8 << 20, let owner = window.owningApplication, (browser ? MacChromeWindow.shared.owns(owner.processID) : try claudePIDs().contains(owner.processID)) else {
             throw Failure(7, "window_changed")

@@ -12,6 +12,7 @@
 | 选择 macOS、Windows、Linux 安装包，配置代理并打开第一个项目 | [开始使用](getting-started.md) |
 | 选择与主机同类的客机系统，了解原生工具、镜像与数据保留 | [选择客机系统](guide/guest-systems.md) |
 | 查看快捷键、文件保存、关闭与退出行为 | [日常使用](getting-started.md#日常使用) |
+| 在本机虚拟 Mac 中直接使用完整桌面 | [原生桌面与虚拟机启动器](native-macos-launcher.md) |
 | 在 Windows 上安装、使用和更新 | [Windows 支持](windows.md) |
 | 在 Linux 上安装、使用和更新 | [Linux 支持](linux.md) |
 | 升级应用、更新环境工具或卸载 | [升级与卸载](getting-started.md#升级与卸载) |

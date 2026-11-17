@@ -73,6 +73,11 @@ func runVZ(ctx context.Context, machine *apple.VirtualMachine, dir string) error
 	done := make(chan error, 1)
 	go func() { done <- serveLogin(runCtx, dir, vzSurface{}); C.cageLoginStop() }()
 	go func() {
+		if serveNativeDesktop(runCtx, dir) != nil {
+			C.cageLoginStop()
+		}
+	}()
+	go func() {
 		ticker := time.NewTicker(250 * time.Millisecond)
 		defer ticker.Stop()
 		running := false

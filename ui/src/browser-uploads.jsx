@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { api, uploadFile, native, nativeAvailable } from "./api";
 import { Modal } from "./views";
 
-export function BrowserUploads({ requests = [], onStatus }) {
+export function BrowserUploads({ requests = [], onStatus, onChooseDirectory }) {
   const [hidden, setHidden] = useState("");
   const request = requests.find((item) => !item.directory && item.id !== hidden && (!item.kind || item.kind === "chooser"));
   const [progress, setProgress] = useState("");
@@ -102,6 +102,7 @@ export function BrowserUploads({ requests = [], onStatus }) {
             }
           />
         </label>}
+        {onChooseDirectory && <button disabled={Boolean(progress)} onClick={() => onChooseDirectory(request)}>选择工作项目</button>}
         {progress && (
           <>
             <p role="status">

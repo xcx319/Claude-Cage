@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createMacWindowInput } from "./macos-window-input.mjs";
 
-function fixture() {
+function fixture(request) {
   let current = { pid: 23, window: 70, geometry: "geometry-1" }, visible = true;
   const calls = [], errors = [], captured = new Set(), eventWindow = new EventTarget();
   const element = Object.assign(new EventTarget(), {
@@ -16,7 +16,7 @@ function fixture() {
   });
   const input = createMacWindowInput({
     element, frame: () => current, active: () => visible,
-    request: async (action, fields) => { calls.push({ action, ...fields }); return { ok: true }; },
+    request: async (action, fields) => { calls.push({ action, ...fields }); await request?.(action, fields); return { ok: true }; },
     onError: error => errors.push(error), eventWindow,
   });
   input.setKeyboardTarget({ focus() {}, classList: { add() {} } });
@@ -174,4 +174,120 @@ test("native window merges wheel events queued behind a slow scroll and keeps th
     assert.equal(calls[1].y, 0.6);
     assert.deepEqual(errors, []);
   } finally { input.dispose(); }
+});
+
+async function queuedWheels(exercise) {
+  const f = fixture();
+  let release;
+  const gate = f.input.run(() => new Promise(resolve => { release = resolve; }));
+  await Promise.resolve();
+  const wheel = (y, x = 0, fields = {}) => f.pointer("wheel", { deltaY: y, deltaX: x, ...fields });
+  try {
+    exercise(f, wheel);
+    const drained = f.input.run(() => {});
+    release(); await gate; await drained;
+    return f.calls.slice();
+  } finally { f.input.dispose(); }
+}
+
+test("wheel groups conserve full displacement within each request limit", async () => {
+  const calls = await queuedWheels((f, wheel) => { wheel(900, 800); wheel(900, 800); wheel(5000, -5000); });
+  assert.deepEqual(calls.map(c => [c.delta, c.deltaX]), [[900,800], [900,800], [1200,-1200], [1200,-1200], [1200,-1200], [1200,-1200], [200,-200]]);
+});
+
+test("wheel overflow stays before later keys and attachments", async () => {
+  const calls = await queuedWheels((f, wheel) => {
+    wheel(700); wheel(700);
+    f.input.sendKey(97, "KeyA", true);
+    wheel(200);
+    f.input.run(() => { f.calls.push({ action: "attachment" }); });
+    wheel(300);
+  });
+  assert.deepEqual(calls.map(c => [c.action,c.delta]), [["scroll",700],["scroll",700],["key",undefined],["scroll",200],["attachment",undefined],["scroll",300]]);
+});
+
+test("wheel groups never cross direction, coordinate, pointer or blur boundaries", async () => {
+  const calls = await queuedWheels((f, wheel) => {
+    wheel(100); wheel(-100); wheel(-100,0,{clientX:200});
+    f.pointer("pointermove"); wheel(-100,0,{clientX:200});
+    f.eventWindow.dispatchEvent(new Event("blur")); wheel(-100,0,{clientX:200});
+  });
+  assert.deepEqual(calls.map(c => c.action), ["scroll","scroll","scroll","pointer","scroll","input-reset","scroll"]);
+  assert.deepEqual(calls.filter(c => c.action === "scroll").map(c => [c.delta,c.x]), [[100,.25],[-100,.25],[-100,.45],[-100,.45],[-100,.45]]);
+});
+
+test("wheel geometry changes reject old work and failed scrolls are not retried", async () => {
+  await assert.rejects(queuedWheels((f, wheel) => { wheel(100); f.changeTarget(); wheel(100); }), /输入窗口已变化/);
+  const failure = new Error("scroll failed");
+  const f = fixture(action => { if(action === "scroll") throw failure; });
+  f.pointer("wheel", {deltaY:100,deltaX:0});
+  await assert.rejects(f.input.run(() => {}), failure);
+  assert.deepEqual(f.calls.map(c => c.action), ["scroll","input-reset"]);
+  f.input.dispose();
+});
+
+test("slow-request wheel burst preserves existing batching without losing displacement", async t => {
+  let ticks = 0, release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const f = fixture(async action => { if(action === "scroll") { ticks++; if(ticks === 1) await gate; } });
+  f.pointer("wheel", {deltaY:10,deltaX:0});
+  await new Promise(resolve => setTimeout(resolve));
+  for(let i=0;i<99;i++) f.pointer("wheel", {deltaY:10,deltaX:0});
+  const drained = f.input.run(() => {});
+  release(); await drained;
+  assert.equal(ticks, 2);
+  assert.equal(f.calls.reduce((sum,c) => sum+(c.delta||0),0),1000);
+  t.diagnostic(JSON.stringify({events:100,requests:ticks,serialized_service_ms_at_100ms_per_request:ticks*100}));
+  f.input.dispose();
+});
+
+test("disposing a queued wheel batch sends no scroll or retry", async () => {
+  const f = fixture();
+  let release;
+  const gate = f.input.run(() => new Promise(resolve => { release = resolve; }));
+  await Promise.resolve();
+  f.pointer("wheel", {deltaY:100,deltaX:0});
+  const drained = f.input.run(() => {});
+  f.input.dispose(); release(); await gate;
+  await assert.rejects(drained, /连接已关闭/);
+  assert.deepEqual(f.calls.map(c => c.action), ["input-reset"]);
+});
+
+test("a 5000 wheel delta is fully delivered before a later key", async () => {
+  const calls = await queuedWheels((f, wheel) => { wheel(5000); f.input.sendKey(97,"KeyA",true); });
+  assert.deepEqual(calls.map(c => [c.action,c.delta]), [["scroll",1200],["scroll",1200],["scroll",1200],["scroll",1200],["scroll",200],["key",undefined]]);
+});
+
+test("oversized wheel admission rejects the entire event without partial delivery", async () => {
+  let observed;
+  const calls = await queuedWheels((f, wheel) => { observed=f; wheel(1200*129); f.input.sendKey(97,"KeyA",true); });
+  assert.deepEqual(calls.map(c => c.action), ["key"]);
+  assert.deepEqual(observed.errors, ["窗口输入等待过多，请重新连接"]);
+});
+
+test("each split wheel block revalidates geometry before sending", async () => {
+  const f = fixture(action => { if(action === "scroll") f.changeTarget(); });
+  f.pointer("wheel", {deltaY:5000,deltaX:0});
+  await assert.rejects(f.input.run(() => {}), /输入窗口已变化/);
+  assert.deepEqual(f.calls.map(c => [c.action,c.delta]), [["scroll",1200],["input-reset",undefined]]);
+  f.input.dispose();
+});
+
+test("passive hover deduplicates unchanged quantized coordinates until cursor moves or button clicks", async () => {
+  const f = fixture();
+  try {
+    f.pointer("pointermove", { buttons: 0, clientX: 120, clientY: 105 });
+    f.pointer("pointermove", { buttons: 0, clientX: 120.001, clientY: 105.001 });
+    await f.input.run(() => {});
+    assert.equal(f.calls.length, 1);
+    f.pointer("pointermove", { buttons: 0, clientX: 140, clientY: 105 });
+    await f.input.run(() => {});
+    assert.equal(f.calls.length, 2);
+    f.pointer("pointerdown", { button: 0, buttons: 1, clientX: 140, clientY: 105 });
+    f.pointer("pointerup", { button: 0, buttons: 0, clientX: 140, clientY: 105 });
+    f.pointer("pointermove", { buttons: 0, clientX: 140, clientY: 105 });
+    await f.input.run(() => {});
+    assert.equal(f.calls.length, 5);
+  } finally { f.input.dispose(); }
+
 });

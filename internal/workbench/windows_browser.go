@@ -157,6 +157,10 @@ func nativeBrowserEventDelay(now, used, changed time.Time) time.Duration {
 func (s *Server) subscribeNativeBrowser(parent context.Context) io.ReadCloser {
 	ctx, cancel := context.WithCancel(parent)
 	reader, writer := io.Pipe()
+	// Bind the subscription to this browser lifetime. A stopped environment
+	// cancels this owner; an old SSE poll must not create a new SSH client while
+	// the VM is shutting down or replace the next startup's connection.
+	client := s.nativeBrowserClient()
 	go func() {
 		defer writer.Close()
 		defer cancel()
@@ -168,8 +172,7 @@ func (s *Server) subscribeNativeBrowser(parent context.Context) io.ReadCloser {
 		var sequence uint64
 		var downloadRevision uint64
 		for {
-			body, _ := json.Marshal(map[string]any{"after": sequence, "onlyChanges": true})
-			data, err := s.nativeBrowserAPI(ctx, "GET", "/events", body)
+			data, err := client.request(ctx, "GET", "/events", map[string]any{"after": sequence, "onlyChanges": true})
 			if err != nil {
 				_ = writer.CloseWithError(err)
 				return
