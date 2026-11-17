@@ -333,6 +333,31 @@ func TestNativeBrowserViewerOwnershipUsesServiceCapability(t *testing.T) {
 	}
 }
 
+func TestNativeBrowserSubscriptionCannotRecreateStoppedOwner(t *testing.T) {
+	client := fixtureWindowsBrowserClient(t)
+	s := &Server{windowsBrowserControl: client}
+	t.Cleanup(s.closeWindowsBrowser)
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	stream := s.subscribeNativeBrowser(ctx)
+	defer stream.Close()
+	read := bufio.NewReader(stream)
+	if _, err := read.ReadString('\n'); err != nil {
+		t.Fatal("subscription never connected", err)
+	}
+	s.closeWindowsBrowser()
+	_, _ = io.ReadAll(read)
+	if ctx.Err() != nil {
+		t.Fatal("stopped owner's event stream did not end")
+	}
+	s.mu.Lock()
+	recreated := s.windowsBrowserControl != nil
+	s.mu.Unlock()
+	if recreated {
+		t.Fatal("old event subscription created a new browser owner after stop")
+	}
+}
+
 func TestNativeBrowserEventPollSlowsOnlyWhenNothingUsesOrChangesTheBrowser(t *testing.T) {
 	now := time.Unix(1_000, 0)
 	long := now.Add(-time.Minute)

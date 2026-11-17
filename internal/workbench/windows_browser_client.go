@@ -18,6 +18,8 @@ import (
 
 // windowsBrowserClient owns a viewer's authenticated relay connection. The GUI
 // agent owns Chrome, so closing this client preserves tabs and unsaved editors.
+var errNativeBrowserDisconnected = errors.New("客机浏览器连接已关闭，请恢复连接后核对操作结果")
+
 type windowsBrowserClient struct {
 	ownsBrowser bool
 	mu          sync.Mutex
@@ -182,6 +184,17 @@ func (c *windowsBrowserClient) releaseViewerInput() {
 }
 
 func (c *windowsBrowserClient) request(ctx context.Context, method, path string, input any) ([]byte, error) {
+	data, err := c.requestOnce(ctx, method, path, input)
+	// A persistent guest service survives a stale SSH viewer connection.
+	// Only replay observational GETs; a lost mutation reply has an unknown
+	// outcome and must never turn into a duplicate click, key or transfer.
+	if method == "GET" && validWindowsBrowserRoute(method, path) && errors.Is(err, errNativeBrowserDisconnected) && ctx.Err() == nil {
+		return c.requestOnce(ctx, method, path, input)
+	}
+	return data, err
+}
+
+func (c *windowsBrowserClient) requestOnce(ctx context.Context, method, path string, input any) ([]byte, error) {
 	if !validWindowsBrowserRoute(method, path) {
 		return nil, browserInputError{errors.New("客机浏览器操作无效")}
 	}
@@ -228,7 +241,11 @@ func (c *windowsBrowserClient) request(ctx context.Context, method, path string,
 	// Finish the in-flight reply even if a viewer leaves, preserving editor buffers.
 	if c.ownsBrowser {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(c.ctx, 40*time.Second)
+		deadline := time.Now().Add(40 * time.Second)
+		if callerDeadline, ok := ctx.Deadline(); ok && callerDeadline.Before(deadline) {
+			deadline = callerDeadline
+		}
+		ctx, cancel = context.WithDeadline(c.ctx, deadline)
 		defer cancel()
 	}
 	process := c.cmd.Process
@@ -243,11 +260,18 @@ func (c *windowsBrowserClient) request(ctx context.Context, method, path string,
 		}
 	}()
 	if _, err = c.input.Write(append(body, '\n')); err != nil || !c.output.Scan() {
+		reason := "eof"
+		if err != nil {
+			reason = "write_failed"
+		} else if c.output.Err() != nil {
+			reason = "read_failed"
+		}
 		c.disconnectLocked()
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, errors.New("客机浏览器连接已关闭，请恢复连接后核对操作结果")
+		diagnostics.Log("warn", "native-browser", method+" "+path+" transport closed ("+reason+")")
+		return nil, errNativeBrowserDisconnected
 	}
 	data := append([]byte(nil), c.output.Bytes()...)
 	if err := ctx.Err(); err != nil {
