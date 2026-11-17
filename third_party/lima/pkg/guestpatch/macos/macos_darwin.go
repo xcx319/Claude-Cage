@@ -140,19 +140,10 @@ func writeGuestFiles(ctx context.Context, dataSliceDevice, mnt string) error {
 		}
 	}
 
-	const initSh = `#!/bin/sh
-set -eux
-date
-if [ ! -e /Volumes/cidata ]; then
-  echo "/Volumes/cidata is not mounted" >&2
-  exit 1
-fi
-exec /Volumes/cidata/lima-guestagent fake-cloud-init
-`
 	if err := os.MkdirAll(filepath.Join(mnt, "usr/local/sbin"), 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(mnt, "usr/local/sbin/lima-macos-init.sh"), []byte(initSh), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(mnt, "usr/local/sbin/lima-macos-init.sh"), []byte(initScript), 0o755); err != nil {
 		return err
 	}
 
